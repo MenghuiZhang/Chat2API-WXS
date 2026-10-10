@@ -15,6 +15,9 @@ import {
   AddAccountDialog,
   AccountDetail,
   ProviderFilter,
+  TempMailSettingsDialog,
+  BatchRegisterDialog,
+  mapOAuthCredentials,
 } from '@/components/providers'
 import { ModelEditor } from '@/components/models/ModelEditor'
 import type { 
@@ -27,6 +30,7 @@ import type {
 import { FilterType, StatusFilter } from '@/components/providers/ProviderFilter'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Server, ArrowLeft } from 'lucide-react'
+import type { ProviderVendor } from '@/types/electron'
 
 type ViewMode = 'providers' | 'accounts' | 'account-detail'
 
@@ -48,6 +52,17 @@ export function Providers() {
   
   const [showAddAccountDialog, setShowAddAccountDialog] = useState(false)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
+  const [showTempMailSettings, setShowTempMailSettings] = useState(false)
+  const [showBatchRegister, setShowBatchRegister] = useState(false)
+  const [isRegistering, setIsRegistering] = useState(false)
+  const [registerStatus, setRegisterStatus] = useState('')
+  const [batchDone, setBatchDone] = useState(0)
+  const [batchTotal, setBatchTotal] = useState(0)
+  const cancelBatchRef = useRef(false)
+  const [isBatchChecking, setIsBatchChecking] = useState(false)
+  const [batchCheckStatus, setBatchCheckStatus] = useState('')
+  /** True while any registration flow (manual, batch or auto-refill) runs. */
+  const registeringRef = useRef(false)
   
   const [showModelEditor, setShowModelEditor] = useState(false)
   const [modelEditorProvider, setModelEditorProvider] = useState<{ id: string; name: string } | null>(null)
@@ -139,6 +154,122 @@ export function Providers() {
 
     return unsubscribe
   }, [])
+
+  // Accounts deleted by the main process (auto-delete of accounts that
+  // failed validation) must disappear from the local store immediately.
+  useEffect(() => {
+    if (!window.electronAPI?.accounts?.onRemoved) return
+
+    const unsubscribe = window.electronAPI.accounts.onRemoved((info) => {
+      const state = useProvidersStore.getState()
+      if (!state.getAccountById(info.id)) return
+      state.removeAccount(info.id)
+      const updatedAccounts = useProvidersStore.getState().getAccountsByProvider(info.providerId)
+      state.updateAccountCount(
+        info.providerId,
+        updatedAccounts.length,
+        updatedAccounts.filter((a) => a.status === 'active').length
+      )
+    })
+
+    return unsubscribe
+  }, [])
+
+  // The main process asks the renderer to register replacement accounts
+  // after a full check auto-deleted broken ones (registration requires the
+  // renderer-driven temp-mail/in-app window flow).
+  useEffect(() => {
+    if (!window.electronAPI?.accounts?.onRefillNeeded) return
+
+    const unsubscribe = window.electronAPI.accounts.onRefillNeeded((requests) => {
+      void handleAutoRefill(requests)
+    })
+
+    return unsubscribe
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  /**
+   * Register replacement accounts for auto-deleted broken accounts.
+   * Skipped while another registration flow is running (the periodic
+   * check will trigger a new request on its next run).
+   */
+  const handleAutoRefill = async (
+    requests: { providerId: string; count: number }[],
+  ): Promise<void> => {
+    if (registeringRef.current) {
+      console.log('[Providers] Auto-refill skipped: a registration flow is already running')
+      return
+    }
+
+    // Auto-registration currently only supports Qwen AI; skip other providers.
+    const qwenRequests = requests.filter(
+      (r) => r.providerId === 'qwen-ai' && r.count > 0,
+    )
+    const unsupported = requests.filter(
+      (r) => r.providerId !== 'qwen-ai' && r.count > 0,
+    )
+    if (unsupported.length > 0) {
+      console.log(
+        '[Providers] Auto-refill skipped for unsupported providers:',
+        unsupported.map((r) => r.providerId).join(', '),
+      )
+    }
+    if (qwenRequests.length === 0) return
+
+    try {
+      const configured = await window.electronAPI?.tempMail?.isConfigured()
+      if (!configured) {
+        toast({
+          title: t('providers.autoRefillSkipped'),
+          description: t('providers.tempMailNotConfigured'),
+          variant: 'destructive',
+        })
+        return
+      }
+    } catch {
+      // Fall through: the main process validates again and reports the error.
+    }
+
+    registeringRef.current = true
+    setIsRegistering(true)
+    let succeeded = 0
+    try {
+      let gapSeconds = 10
+      try {
+        const cfg = await window.electronAPI.config.get()
+        gapSeconds = Math.max(0, Math.min(300, cfg.registerIntervalSeconds ?? 10))
+      } catch {
+        // Keep the default gap when the config cannot be read.
+      }
+
+      for (const request of qwenRequests) {
+        for (let i = 0; i < request.count; i++) {
+          setRegisterStatus(
+            t('providers.autoRefillStatus', { current: i + 1, total: request.count }),
+          )
+          const ok = await registerOneAccount('qwen-ai')
+          if (ok) succeeded++
+          if (gapSeconds > 0 && i < request.count - 1) {
+            setRegisterStatus(t('providers.batchWaiting', { seconds: gapSeconds }))
+            await new Promise((resolve) => setTimeout(resolve, gapSeconds * 1000))
+          }
+        }
+      }
+
+      toast({
+        title: t('providers.autoRefillFinished'),
+        description: t('providers.autoRefillDone', {
+          done: succeeded,
+          total: qwenRequests.reduce((sum, r) => sum + r.count, 0),
+        }),
+      })
+    } finally {
+      registeringRef.current = false
+      setIsRegistering(false)
+      setRegisterStatus('')
+    }
+  }
 
   // Subscribe to automatic model updates pushed by the main process
   // (auto model update scheduler / manual "Update Now"), refreshing the list.
@@ -473,6 +604,217 @@ export function Providers() {
     }
   }
 
+  /**
+   * Run one Qwen AI auto-registration (temp-mail flow in the main process)
+   * and add the resulting account automatically. Returns true on success.
+   * `isCancelled` lets a running batch stop after the current iteration.
+   */
+  const registerOneAccount = async (
+    providerId: string,
+    isCancelled?: () => boolean,
+  ): Promise<boolean> => {
+    let unsubscribe: (() => void) | undefined
+    try {
+      unsubscribe = window.electronAPI?.oauth?.onProgress((event) => {
+        if (event?.message) setRegisterStatus(event.message)
+      })
+
+      const result = await window.electronAPI.oauth.startInAppLogin(
+        providerId,
+        providerId as ProviderVendor,
+        undefined,
+        'register'
+      )
+
+      if (isCancelled?.()) return false
+
+      if (result?.success && result.credentials) {
+        const mappedCredentials = mapOAuthCredentials(providerId, result.credentials)
+        const autoName =
+          result.accountInfo?.name ||
+          result.accountInfo?.email?.split('@')[0] ||
+          'Qwen AI Auto'
+        setRegisterStatus(t('providers.autoAddingAccount'))
+
+        const account = await window.electronAPI.accounts.add({
+          providerId,
+          name: autoName,
+          email: result.accountInfo?.email,
+          credentials: mappedCredentials,
+        })
+        store.addAccount(account)
+
+        const providerAccounts = store.getAccountsByProvider(providerId)
+        store.updateAccountCount(
+          providerId,
+          providerAccounts.length,
+          providerAccounts.filter((a) => a.status === 'active').length
+        )
+
+        toast({
+          title: t('providers.registerSuccess'),
+          description: result.accountInfo?.email || autoName,
+        })
+        return true
+      }
+
+      toast({
+        title: t('providers.registerFailed'),
+        description: result?.error || t('providers.loginFailed'),
+        variant: 'destructive',
+      })
+      return false
+    } catch (error) {
+      toast({
+        title: t('providers.registerFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      })
+      return false
+    } finally {
+      unsubscribe?.()
+    }
+  }
+
+  const handleRegisterAccount = async () => {
+    if (!store.selectedProviderId || isRegistering) return
+    const providerId = store.selectedProviderId
+
+    // The temp mail service is not bundled: require local configuration first.
+    try {
+      const configured = await window.electronAPI?.tempMail?.isConfigured()
+      if (!configured) {
+        toast({
+          title: t('providers.registerFailed'),
+          description: t('providers.tempMailNotConfigured'),
+          variant: 'destructive',
+        })
+        setShowTempMailSettings(true)
+        return
+      }
+    } catch {
+      // Fall through: the main process validates again and reports the error.
+    }
+
+    setIsRegistering(true)
+    setRegisterStatus(t('providers.openingRegisterWindow'))
+    try {
+      await registerOneAccount(providerId)
+    } finally {
+      setIsRegistering(false)
+      setRegisterStatus('')
+    }
+  }
+
+  /** Sequentially register `count` accounts; each success is auto-added. */
+  const handleStartBatch = async (count: number) => {
+    if (!store.selectedProviderId || isRegistering) return
+    const providerId = store.selectedProviderId
+
+    try {
+      const configured = await window.electronAPI?.tempMail?.isConfigured()
+      if (!configured) {
+        toast({
+          title: t('providers.registerFailed'),
+          description: t('providers.tempMailNotConfigured'),
+          variant: 'destructive',
+        })
+        setShowBatchRegister(false)
+        setShowTempMailSettings(true)
+        return
+      }
+    } catch {
+      // Fall through: the main process validates again and reports the error.
+    }
+
+    cancelBatchRef.current = false
+    registeringRef.current = true
+    setIsRegistering(true)
+    setBatchTotal(count)
+    setBatchDone(0)
+
+    // Configurable pause between two consecutive registrations.
+    let gapSeconds = 10
+    try {
+      const cfg = await window.electronAPI.config.get()
+      gapSeconds = Math.max(0, Math.min(300, cfg.registerIntervalSeconds ?? 10))
+    } catch {
+      // Keep the default gap when the config cannot be read.
+    }
+
+    let succeeded = 0
+    for (let i = 0; i < count; i++) {
+      if (cancelBatchRef.current) break
+      setRegisterStatus(t('providers.batchIteration', { current: i + 1, total: count }))
+      const ok = await registerOneAccount(providerId, () => cancelBatchRef.current)
+      if (cancelBatchRef.current) break
+      if (ok) succeeded++
+      setBatchDone(i + 1)
+      if (gapSeconds > 0 && i < count - 1 && !cancelBatchRef.current) {
+        setRegisterStatus(t('providers.batchWaiting', { seconds: gapSeconds }))
+        await new Promise((resolve) => setTimeout(resolve, gapSeconds * 1000))
+      }
+    }
+    const cancelled = cancelBatchRef.current
+
+    registeringRef.current = false
+    setIsRegistering(false)
+    setRegisterStatus('')
+    setBatchTotal(0)
+    setBatchDone(0)
+    setShowBatchRegister(false)
+    toast({
+      title: cancelled ? t('providers.batchStopped') : t('providers.batchFinished'),
+      description: t('providers.batchDone', { done: succeeded, total: count }),
+    })
+  }
+
+  const handleStopBatch = () => {
+    cancelBatchRef.current = true
+    // The in-flight registration cannot be aborted mid-window; the loop
+    // checks the flag before starting the next iteration.
+    setRegisterStatus(t('providers.batchStopping'))
+    window.electronAPI?.oauth?.cancelInAppLogin?.().catch(() => undefined)
+  }
+
+  /** Validate every account sequentially in the main process. */
+  const handleBatchCheck = async () => {
+    if (isBatchChecking) return
+    setIsBatchChecking(true)
+    setBatchCheckStatus(t('providers.batchCheckStarting'))
+    let unsubscribeProgress: (() => void) | undefined
+    try {
+      unsubscribeProgress = window.electronAPI?.accounts?.onBatchValidateProgress?.((event) => {
+        setBatchCheckStatus(
+          t('providers.batchCheckProgress', {
+            current: event.current,
+            total: event.total,
+            name: event.name,
+          })
+        )
+      })
+      const result = await window.electronAPI.accounts.batchValidate()
+      toast({
+        title: t('providers.batchCheckFinished'),
+        description: t('providers.batchCheckResult', {
+          valid: result.valid,
+          total: result.total,
+          deleted: result.deleted,
+        }),
+      })
+    } catch (error) {
+      toast({
+        title: t('providers.batchCheckFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      })
+    } finally {
+      unsubscribeProgress?.()
+      setIsBatchChecking(false)
+      setBatchCheckStatus('')
+    }
+  }
+
   const handleUpdateAccount = async (id: string, updates: Partial<Account>) => {
     try {
       const account = store.getAccountById(id)
@@ -695,6 +1037,30 @@ export function Providers() {
           onDeleteAccount={handleDeleteAccount}
           onValidateAccount={handleValidateAccount}
           onViewDetail={handleViewAccountDetail}
+          onRegisterAccount={handleRegisterAccount}
+          onOpenTempMailSettings={() => setShowTempMailSettings(true)}
+          onOpenBatchRegister={() => setShowBatchRegister(true)}
+          isRegistering={isRegistering}
+          registerStatus={registerStatus}
+          onBatchCheck={handleBatchCheck}
+          isBatchChecking={isBatchChecking}
+          batchCheckStatus={batchCheckStatus}
+        />
+
+        <TempMailSettingsDialog
+          open={showTempMailSettings}
+          onOpenChange={setShowTempMailSettings}
+        />
+
+        <BatchRegisterDialog
+          open={showBatchRegister}
+          onOpenChange={setShowBatchRegister}
+          isRegistering={isRegistering}
+          registerStatus={registerStatus}
+          doneCount={batchDone}
+          totalCount={batchTotal}
+          onStart={handleStartBatch}
+          onStop={handleStopBatch}
         />
 
         <AddAccountDialog

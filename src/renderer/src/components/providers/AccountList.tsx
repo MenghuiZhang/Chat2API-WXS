@@ -28,7 +28,12 @@ import {
   AlertCircle,
   Activity,
   Plus,
-  Trash
+  Trash,
+  UserPlus,
+  Settings2,
+  ListPlus,
+  Loader2,
+  ShieldCheck
 } from 'lucide-react'
 import {
   Dialog,
@@ -40,6 +45,7 @@ import {
 } from '@/components/ui/dialog'
 import type { Account, AccountStatus } from '@/types/electron'
 import { cn } from '@/lib/utils'
+import { AccountMaintenanceDialog } from './AccountMaintenanceDialog'
 
 interface AccountListProps {
   accounts: Account[]
@@ -49,6 +55,18 @@ interface AccountListProps {
   onDeleteAccount: (id: string) => void
   onValidateAccount: (id: string) => void
   onViewDetail: (account: Account) => void
+  /** Qwen AI only: trigger the temp-mail auto-registration flow */
+  onRegisterAccount?: () => void
+  /** Qwen AI only: open the temp mail service settings dialog */
+  onOpenTempMailSettings?: () => void
+  /** Qwen AI only: open the batch registration dialog */
+  onOpenBatchRegister?: () => void
+  isRegistering?: boolean
+  registerStatus?: string
+  /** Validate every account sequentially (main process) */
+  onBatchCheck?: () => void
+  isBatchChecking?: boolean
+  batchCheckStatus?: string
 }
 
 export function AccountList({
@@ -59,9 +77,18 @@ export function AccountList({
   onDeleteAccount,
   onValidateAccount,
   onViewDetail,
+  onRegisterAccount,
+  onOpenTempMailSettings,
+  onOpenBatchRegister,
+  isRegistering,
+  registerStatus,
+  onBatchCheck,
+  isBatchChecking,
+  batchCheckStatus,
 }: AccountListProps) {
   const { t } = useTranslation()
   const [validatingIds, setValidatingIds] = useState<Set<string>>(new Set())
+  const [showMaintenance, setShowMaintenance] = useState(false)
   const [clearingChatsId, setClearingChatsId] = useState<string | null>(null)
   const [showClearChatsDialog, setShowClearChatsDialog] = useState(false)
   const [selectedAccountForClear, setSelectedAccountForClear] = useState<Account | null>(null)
@@ -183,10 +210,65 @@ export function AccountList({
           <span>•</span>
           <span className="text-green-600">{activeCount} {t('providers.onlineCount')}</span>
         </div>
-        <Button size="sm" onClick={onAddAccount}>
-          <Plus className="mr-2 h-4 w-4" />
-          {t('providers.addAccount')}
-        </Button>
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          <Button size="sm" variant="outline" onClick={() => setShowMaintenance(true)}>
+            <ShieldCheck className="mr-2 h-4 w-4" />
+            {t('providers.accountMaintenance')}
+          </Button>
+          {onBatchCheck && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onBatchCheck}
+              disabled={isBatchChecking}
+            >
+              {isBatchChecking ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-2 h-4 w-4" />
+              )}
+              {isBatchChecking
+                ? batchCheckStatus || t('providers.batchChecking')
+                : t('providers.batchCheck')}
+            </Button>
+          )}
+          {providerId === 'qwen-ai' && onRegisterAccount && (
+            <>
+              <Button size="sm" variant="outline" onClick={onOpenTempMailSettings}>
+                <Settings2 className="mr-2 h-4 w-4" />
+                {t('providers.tempMailSettings')}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onOpenBatchRegister}
+                disabled={isRegistering}
+              >
+                <ListPlus className="mr-2 h-4 w-4" />
+                {t('providers.batchRegister')}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onRegisterAccount}
+                disabled={isRegistering}
+              >
+                {isRegistering ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <UserPlus className="mr-2 h-4 w-4" />
+                )}
+                {isRegistering
+                  ? registerStatus || t('providers.registering')
+                  : t('providers.registerAccount')}
+              </Button>
+            </>
+          )}
+          <Button size="sm" onClick={onAddAccount}>
+            <Plus className="mr-2 h-4 w-4" />
+            {t('providers.addAccount')}
+          </Button>
+        </div>
       </div>
 
       <ScrollArea className="h-[calc(100vh-400px)]">
@@ -356,6 +438,22 @@ export function AccountList({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Batch check progress dialog */}
+      <Dialog open={isBatchChecking === true} onOpenChange={() => undefined}>
+        <DialogContent className="sm:max-w-[380px]">
+          <DialogHeader>
+            <DialogTitle>{t('providers.batchCheck')}</DialogTitle>
+            <DialogDescription>{t('providers.batchCheckDesc')}</DialogDescription>
+          </DialogHeader>
+          <div className="text-sm font-medium break-all">{batchCheckStatus}</div>
+        </DialogContent>
+      </Dialog>
+
+      <AccountMaintenanceDialog
+        open={showMaintenance}
+        onOpenChange={setShowMaintenance}
+      />
     </div>
   )
 }

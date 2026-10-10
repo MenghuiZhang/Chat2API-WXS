@@ -119,6 +119,33 @@ export interface AppConfig {
   maxConcurrentPerAccount: number
   /** How long (ms) a request may wait for a free account slot before 429 */
   accountBusyTimeoutMs: number
+  /** Delay (seconds) between two consecutive accounts in a batch registration */
+  registerIntervalSeconds?: number
+  /** Periodically validate all accounts in the background */
+  autoCheckAccounts?: boolean
+  /** Interval (minutes) between automatic account validations */
+  autoCheckAccountsIntervalMinutes?: number
+  /** Automatically delete accounts that fail validation */
+  autoDeleteBadAccounts?: boolean
+  /** Automatically register replacement accounts after bad ones were auto-deleted */
+  autoRefillAccounts?: boolean
+  /** Target number of accounts per provider (0 = disabled); below it, new accounts are auto-registered */
+  targetAccountCount?: number
+  /** Temporary mailbox settings for the Qwen AI auto-registration flow */
+  tempMail?: TempMailConfig
+}
+
+/**
+ * Temporary mailbox (Cloudflare Temp Email) configuration
+ * used by the Qwen AI auto-registration flow.
+ */
+export interface TempMailConfig {
+  /** API base URL of the Cloudflare Temp Email backend */
+  apiUrl: string
+  /** Admin authentication password (sent as x-admin-auth header) */
+  adminPassword: string
+  /** Default mailbox domain used when creating addresses */
+  domain: string
 }
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'

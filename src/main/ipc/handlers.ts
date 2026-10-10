@@ -4,7 +4,12 @@ import { IpcChannels } from './channels'
 import { storeManager } from '../store/store'
 import { ProviderManager } from '../store/providers'
 import { AccountManager } from '../store/accounts'
-import { startAccountStatusScheduler } from '../store/accountStatusScheduler'
+import {
+  startAccountStatusScheduler,
+  applyAccountCheckConfig,
+  runFullCheck,
+  requestRefillToTarget,
+} from '../store/accountStatusScheduler'
 import {
   startModelUpdateScheduler,
   applyModelUpdateConfig,
@@ -14,6 +19,7 @@ import { ProviderChecker } from '../providers/checker'
 import { CustomProviderManager } from '../providers/custom'
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
 import { oauthManager } from '../oauth/manager'
+import { createTempAddress, isTempMailConfigured } from '../oauth/tempMail'
 import { ProxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
 import { sessionManager } from '../proxy/sessionManager'
@@ -31,7 +37,7 @@ import { PerplexityAdapter } from '../proxy/adapters/perplexity'
 import { QwenAdapter } from '../proxy/adapters/qwen'
 import { QwenAiAdapter } from '../proxy/adapters/qwen-ai'
 import { ZaiAdapter } from '../proxy/adapters/zai'
-import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig } from '../../shared/types'
+import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, TempMailConfig } from '../../shared/types'
 import type { SystemPrompt, SessionConfig, SessionRecord, ManagementApiConfig } from '../store/types'
 import type { ProviderType } from '../oauth/types'
 
@@ -243,6 +249,19 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     // Register/unregister OS-level boot autostart
     if (updates.autoStart !== undefined) {
       applyAutoStart(updates.autoStart)
+    }
+
+    // Re-apply the periodic account check schedule
+    if (
+      updates.autoCheckAccounts !== undefined ||
+      updates.autoCheckAccountsIntervalMinutes !== undefined
+    ) {
+      applyAccountCheckConfig()
+    }
+
+    // Target account count changed: check immediately whether refills are needed
+    if (updates.targetAccountCount !== undefined) {
+      requestRefillToTarget()
     }
 
     BrowserWindow.getAllWindows().forEach((win) => {
@@ -648,6 +667,13 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     return result.valid
   })
 
+  ipcMain.handle(
+    IpcChannels.ACCOUNTS_BATCH_VALIDATE,
+    async (): Promise<{ total: number; valid: number; deleted: number }> => {
+      return runFullCheck()
+    }
+  )
+
   ipcMain.handle(IpcChannels.ACCOUNTS_VALIDATE_TOKEN, async (_, providerId: string, credentials: Record<string, string>) => {
     let provider = ProviderManager.getById(providerId)
     
@@ -762,11 +788,11 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     return await oauthManager.loginWithToken(data.providerId, data.providerType as ProviderType, data.token, data.realUserID, data.mimoUserId, data.mimoPhToken)
   })
 
-  ipcMain.handle(IpcChannels.OAUTH_START_IN_APP_LOGIN, async (_, data: { providerId: string, providerType: ProviderVendor, timeout?: number }): Promise<OAuthResult> => {
-    console.log('Starting in-app OAuth login:', data.providerId, data.providerType)
+  ipcMain.handle(IpcChannels.OAUTH_START_IN_APP_LOGIN, async (_, data: { providerId: string, providerType: ProviderVendor, timeout?: number, mode?: 'login' | 'register' }): Promise<OAuthResult> => {
+    console.log('Starting in-app OAuth login:', data.providerId, data.providerType, 'mode:', data.mode || 'login')
     const config = storeManager.getConfig()
     const proxyMode = (config as any).oauthProxyMode || 'system'
-    return await oauthManager.startInAppLogin(data.providerId, data.providerType as ProviderType, data.timeout, proxyMode)
+    return await oauthManager.startInAppLogin(data.providerId, data.providerType as ProviderType, data.timeout, proxyMode, data.mode)
   })
 
   ipcMain.handle(IpcChannels.OAUTH_CANCEL_IN_APP_LOGIN, async (): Promise<void> => {
@@ -776,6 +802,48 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
 
   ipcMain.handle(IpcChannels.OAUTH_IN_APP_LOGIN_STATUS, async (): Promise<boolean> => {
     return oauthManager.isInAppLoginOpen()
+  })
+
+  // ==================== Temp Mail (auto-registration) Handlers ====================
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_GET_CONFIG, async (): Promise<TempMailConfig> => {
+    // Return the RAW stored values (empty when never configured) so the
+    // settings dialog never pre-fills secrets. There are no bundled
+    // defaults: the service must be configured by the user.
+    const stored = (storeManager.getConfig() as { tempMail?: Partial<TempMailConfig> }).tempMail
+    return {
+      apiUrl: stored?.apiUrl || '',
+      adminPassword: stored?.adminPassword || '',
+      domain: stored?.domain || '',
+    }
+  })
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_UPDATE_CONFIG, async (_, updates: Partial<TempMailConfig>): Promise<TempMailConfig> => {
+    const current = (storeManager.getConfig() as { tempMail?: Partial<TempMailConfig> }).tempMail || {}
+    const merged: TempMailConfig = {
+      apiUrl: updates.apiUrl !== undefined ? updates.apiUrl.trim() : (current.apiUrl || ''),
+      adminPassword: updates.adminPassword !== undefined ? updates.adminPassword : (current.adminPassword || ''),
+      domain: updates.domain !== undefined ? updates.domain.trim() : (current.domain || ''),
+    }
+    ConfigManager.update({ tempMail: merged })
+    // Return the raw merged values (not defaults-filled) for consistency with GET.
+    return merged
+  })
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_IS_CONFIGURED, async (): Promise<boolean> => {
+    return isTempMailConfigured()
+  })
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_TEST, async (): Promise<{ success: boolean; address?: string; error?: string }> => {
+    try {
+      const addr = await createTempAddress()
+      return { success: true, address: addr.address }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
   })
 
   ipcMain.handle(IpcChannels.OAUTH_VALIDATE_TOKEN, async (_, data: { providerId: string, providerType: ProviderVendor, credentials: Record<string, string> }) => {

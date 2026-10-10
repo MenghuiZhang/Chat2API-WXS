@@ -277,12 +277,13 @@ export class OAuthManager extends EventEmitter {
     providerId: string,
     providerType: ProviderType,
     timeout?: number,
-    proxyMode?: 'system' | 'none'
+    proxyMode?: 'system' | 'none',
+    mode?: 'login' | 'register'
   ): Promise<OAuthResult> {
     this.emit('statusChange', 'pending')
     this.sendProgressToRenderer({
       status: 'pending',
-      message: 'Opening login window...',
+      message: mode === 'register' ? 'Opening registration window...' : 'Opening login window...',
     })
 
     return new Promise((resolve) => {
@@ -598,6 +599,7 @@ export class OAuthManager extends EventEmitter {
         providerType,
         timeout: timeout || DEFAULT_TIMEOUT,
         proxyMode,
+        mode: mode || 'login',
       }).then((result) => {
         if (!result.success) {
           completeHandler(result)

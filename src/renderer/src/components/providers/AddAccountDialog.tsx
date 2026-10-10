@@ -47,7 +47,7 @@ function cookiesToString(cookies: any): string {
   return ''
 }
 
-function mapOAuthCredentials(providerId: string | undefined, credentials: Record<string, string>): Record<string, string> {
+export function mapOAuthCredentials(providerId: string | undefined, credentials: Record<string, string>): Record<string, string> {
   if (!providerId) return credentials
 
   const credentialKeyMap: Record<string, string> = {
@@ -210,6 +210,21 @@ export function AddAccountDialog({
     }
   }, [open, editingAccount])
 
+  // Subscribe to OAuth progress events while an in-app login/register flow is
+  // running, so intermediate steps (temp mailbox, verification code, ...)
+  // are visible to the user in real time.
+  useEffect(() => {
+    if (!isOAuthLoading) return
+    const unsubscribe = window.electronAPI?.oauth.onProgress((event) => {
+      if (event.message) {
+        setOAuthStatus(event.message)
+      }
+    })
+    return () => {
+      unsubscribe?.()
+    }
+  }, [isOAuthLoading])
+
   const resetForm = () => {
     setName('')
     setDailyLimit('')
@@ -327,7 +342,9 @@ export function AddAccountDialog({
     try {
       const result = await window.electronAPI?.oauth.startInAppLogin(
         provider.id,
-        provider.id as ProviderVendor
+        provider.id as ProviderVendor,
+        undefined,
+        'login'
       )
       
       if (result?.success && result.credentials) {
