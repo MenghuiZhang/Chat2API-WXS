@@ -238,7 +238,11 @@ export class AccountManager {
       if (result.accountInfo?.email) {
         storeManager.updateAccount(id, { email: result.accountInfo.email })
       }
-    } else {
+    } else if (!result.networkError) {
+      // Only downgrade the status for real credential failures. A network
+      // error (DNS failure, timeout, ...) is transient and must not flip a
+      // healthy account to 'error' — otherwise a brief outage would mark
+      // (and with autoDeleteBadAccounts, delete) every account.
       this.updateStatus(id, 'error', result.error)
     }
     

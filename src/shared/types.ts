@@ -205,6 +205,8 @@ export interface OAuthResult {
 export interface ValidationResult {
   valid: boolean
   error?: string
+  /** True when the failure was a transient connection-level problem (DNS/timeout), not invalid credentials */
+  networkError?: boolean
   validatedAt: number
   accountInfo?: {
     name?: string

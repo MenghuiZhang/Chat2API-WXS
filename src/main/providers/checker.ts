@@ -15,12 +15,50 @@ const CHECK_TIMEOUT = 15000
 export interface TokenCheckResult {
   valid: boolean
   error?: string
+  /**
+   * True when validation failed because of a connection-level problem
+   * (DNS failure, timeout, refused connection) rather than bad credentials.
+   * Callers must NOT delete or downgrade accounts on network errors —
+   * a transient outage would otherwise wipe healthy accounts.
+   */
+  networkError?: boolean
   userInfo?: {
     name?: string
     email?: string
     quota?: number
     used?: number
   }
+}
+
+/**
+ * Detect connection-level failures (no HTTP response received):
+ * ENOTFOUND / EAI_AGAIN (DNS), ECONNREFUSED, ECONNRESET, ETIMEDOUT, etc.
+ * An error with a `response` means the server replied (e.g. 401/403),
+ * which is a credential problem, not a network problem.
+ */
+export function isNetworkError(error: unknown): boolean {
+  if (axios.isAxiosError(error)) {
+    if (error.response) {
+      return false
+    }
+    const code = error.code || ''
+    return (
+      code === 'ENOTFOUND' ||
+      code === 'EAI_AGAIN' ||
+      code === 'ECONNREFUSED' ||
+      code === 'ECONNRESET' ||
+      code === 'ECONNABORTED' ||
+      code === 'ETIMEDOUT' ||
+      code === 'ENETUNREACH' ||
+      code === 'EHOSTUNREACH' ||
+      code === 'ENETDOWN' ||
+      error.message === 'Network Error'
+    )
+  }
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|getaddrinfo|Network Error/i.test(
+    message
+  )
 }
 
 export class ProviderChecker {
@@ -228,6 +266,7 @@ export class ProviderChecker {
       console.error('[DeepSeek] Validation error:', error)
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',
@@ -302,6 +341,7 @@ export class ProviderChecker {
       console.error('[GLM] Validation error:', error)
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',
@@ -370,6 +410,7 @@ export class ProviderChecker {
       console.error('[Kimi] Validation error:', error)
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',
@@ -489,6 +530,7 @@ export class ProviderChecker {
       console.error('[MiniMax] Validation error:', error)
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',
@@ -538,6 +580,7 @@ export class ProviderChecker {
     } catch (error) {
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',
@@ -550,39 +593,9 @@ export class ProviderChecker {
 
     // Access tokens expire after ~15 minutes; refresh proactively so the
     // periodic status check doesn't flip healthy accounts to "error".
-    if (isQwenAiTokenExpiring(token)) {
-      const refreshToken = extractQwenAiRefreshToken(account.credentials)
-      if (refreshToken) {
-        const refreshed = await refreshQwenAiToken(refreshToken)
-        if (refreshed) {
-          console.log('[QwenAI] Checker refreshed access token for account', account.id)
-          token = refreshed.accessToken
-          const updatedCredentials = {
-            ...account.credentials,
-            token: refreshed.accessToken,
-            refresh_token: refreshed.refreshToken,
-            cookies: replaceRefreshTokenCookie(
-              account.credentials.cookies || account.credentials.cookie || '',
-              refreshed.refreshToken
-            ),
-          }
-          account.credentials = updatedCredentials
-          if (account.id === 'temp') {
-            console.warn(
-              '[QwenAI] Checker refreshed token but account id is "temp" — rotated refresh_token was NOT persisted. Pass the real account id to validateCredentials().'
-            )
-          } else {
-            try {
-              const persisted = storeManager.updateAccount(account.id, { credentials: { ...updatedCredentials } })
-              if (!persisted) {
-                console.error('[QwenAI] Checker failed to persist refreshed token: account not found:', account.id)
-              }
-            } catch (error) {
-              console.error('[QwenAI] Checker failed to persist refreshed token:', error)
-            }
-          }
-        }
-      }
+    const didProactiveRefresh = await this.maybeRefreshQwenAiToken(account)
+    if (didProactiveRefresh) {
+      token = account.credentials.token
     }
 
     try {
@@ -604,8 +617,41 @@ export class ProviderChecker {
       // Upstream returns HTTP 200 even for expired sessions; the actual state
       // is in the response body: { success: false, data: { code: 'unauthorized', details: ... } }
       if (response.data?.success === false) {
+        // Instead of immediately failing, attempt a forced token refresh.
+        // The access token may be invalid even though the refresh_token is
+        // still valid (e.g. long idle, server-side rotation). If the forced
+        // refresh succeeds, re-validate with the new token.
         const details = response.data?.data?.details
         const code = response.data?.data?.code
+        console.log('[QwenAI] Validation failed, attempting forced re-auth for account', account.id)
+
+        const reauthed = await this.maybeRefreshQwenAiToken(account, true)
+        if (reauthed) {
+          const retryResp = await axios.get(
+            'https://auth.qwen.ai/api/v2/auths/',
+            {
+              headers: {
+                Authorization: `Bearer ${account.credentials.token}`,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                source: 'web',
+              },
+              timeout: CHECK_TIMEOUT,
+              validateStatus: () => true,
+            }
+          )
+          if (retryResp.status === 200 && retryResp.data?.data) {
+            console.log('[QwenAI] Forced re-auth succeeded for account', account.id)
+            return {
+              valid: true,
+              userInfo: {
+                name: retryResp.data.data.name || retryResp.data.data.email,
+                email: retryResp.data.data.email,
+              },
+            }
+          }
+        }
+
         return { valid: false, error: details || `Validation failed: ${code || 'unauthorized'}` }
       }
 
@@ -620,6 +666,33 @@ export class ProviderChecker {
       }
 
       if (response.status === 401) {
+        // 401 may be fixable via forced refresh; try before giving up.
+        const reauthed = await this.maybeRefreshQwenAiToken(account, true)
+        if (reauthed) {
+          const retryResp = await axios.get(
+            'https://auth.qwen.ai/api/v2/auths/',
+            {
+              headers: {
+                Authorization: `Bearer ${account.credentials.token}`,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                source: 'web',
+              },
+              timeout: CHECK_TIMEOUT,
+              validateStatus: () => true,
+            }
+          )
+          if (retryResp.status === 200 && retryResp.data?.data) {
+            console.log('[QwenAI] Forced re-auth (after 401) succeeded for account', account.id)
+            return {
+              valid: true,
+              userInfo: {
+                name: retryResp.data.data.name || retryResp.data.data.email,
+                email: retryResp.data.data.email,
+              },
+            }
+          }
+        }
         return { valid: false, error: 'Token expired or invalid' }
       }
 
@@ -627,11 +700,78 @@ export class ProviderChecker {
     } catch (error) {
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError
           ? error.message
           : 'Connection failed',
       }
     }
+  }
+
+  /**
+   * Refresh Qwen AI access token via the refresh_token credential.
+   * When `force` is false (proactive), refreshes only when the access token
+   * is expiring soon. When `force` is true, refreshes unconditionally — used
+   * as a re-authentication attempt when validation has already failed.
+   *
+   * On success, the refreshed token pair is persisted to the store (unless
+   * the account id is 'temp') and `account.credentials` is mutated in place.
+   * Returns true when a refresh was performed and succeeded.
+   */
+  private static async maybeRefreshQwenAiToken(
+    account: Account,
+    force = false
+  ): Promise<boolean> {
+    const token = account.credentials.token
+
+    if (!force && !isQwenAiTokenExpiring(token)) {
+      return false
+    }
+
+    const refreshToken = extractQwenAiRefreshToken(account.credentials)
+    if (!refreshToken) {
+      return false
+    }
+
+    const refreshed = await refreshQwenAiToken(refreshToken)
+    if (!refreshed) {
+      if (force) {
+        console.warn('[QwenAI] Forced re-auth failed for account', account.id, '— refresh_token may be expired')
+      }
+      return false
+    }
+
+    console.log(
+      `[QwenAI] Checker ${force ? 'force-' : ''}refreshed access token for account ${account.id}`
+    )
+
+    const updatedCredentials = {
+      ...account.credentials,
+      token: refreshed.accessToken,
+      refresh_token: refreshed.refreshToken,
+      cookies: replaceRefreshTokenCookie(
+        account.credentials.cookies || account.credentials.cookie || '',
+        refreshed.refreshToken
+      ),
+    }
+    account.credentials = updatedCredentials
+
+    if (account.id === 'temp') {
+      console.warn(
+        '[QwenAI] Checker refreshed token but account id is "temp" — rotated refresh_token was NOT persisted. Pass the real account id to validateCredentials().'
+      )
+    } else {
+      try {
+        const persisted = storeManager.updateAccount(account.id, { credentials: { ...updatedCredentials } })
+        if (!persisted) {
+          console.error('[QwenAI] Checker failed to persist refreshed token: account not found:', account.id)
+        }
+      } catch (error) {
+        console.error('[QwenAI] Checker failed to persist refreshed token:', error)
+      }
+    }
+
+    return true
   }
 
   private static checkPerplexityToken(sessionToken: string): TokenCheckResult {
@@ -687,6 +827,7 @@ export class ProviderChecker {
     } catch (error) {
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',
@@ -730,6 +871,7 @@ export class ProviderChecker {
     } catch (error) {
       return {
         valid: false,
+        networkError: isNetworkError(error),
         error: error instanceof AxiosError 
           ? error.message 
           : 'Connection failed',

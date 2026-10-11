@@ -6,9 +6,13 @@
  *     re-validated every minute until they recover.
  *  2. Periodic full check (user-configurable): when `autoCheckAccounts` is
  *     enabled in settings, ALL accounts are validated every
- *     `autoCheckAccountsIntervalMinutes` minutes. Accounts that fail
- *     validation are deleted automatically when `autoDeleteBadAccounts`
- *     is enabled; otherwise they are only marked as error.
+ *     `autoCheckAccountsIntervalMinutes` minutes. When validation fails,
+ *     built-in providers (e.g. Qwen AI) attempt a forced re-authentication
+ *     via stored refresh credentials before marking the account as error.
+ *     Accounts that still fail are deleted when `autoDeleteBadAccounts`
+ *     is enabled; otherwise they are only marked as error. Failures caused
+ *     by transient network problems (DNS failure, timeout, offline) are
+ *     NEVER treated as bad accounts and never trigger deletion.
  *  3. Target account count (user-configurable): when `targetAccountCount`
  *     is > 0, every provider whose account count is below the target gets a
  *     refill request sent to the renderer (which runs the auto-registration
@@ -134,8 +138,10 @@ async function runAbnormalCheck(): Promise<void> {
 
 /**
  * Validate every account once (periodic / manual full check). Accounts
- * that fail are deleted when autoDeleteBadAccounts is enabled, otherwise
- * marked as error. Progress is streamed to the renderer.
+ * that fail with credential errors are deleted when autoDeleteBadAccounts
+ * is enabled, otherwise marked as error. Accounts that fail only because
+ * of network problems are always kept untouched. Progress is streamed to
+ * the renderer.
  */
 export async function runFullCheck(): Promise<{
   total: number
@@ -193,6 +199,14 @@ export async function runFullCheck(): Promise<{
           if (updated) {
             notifyRenderer(updated)
           }
+        } else if (result.networkError) {
+          // Transient connectivity problem (DNS failure, timeout, offline).
+          // Never delete or count these as bad accounts — the credentials
+          // were not proven invalid. The abnormal re-check job will retry.
+          storeManager.addLog(
+            'warn',
+            `Skipped account "${account.name}" during full check: network error (${result.error || 'Unknown error'}) — account kept`
+          )
         } else if (autoDelete) {
           const removed = AccountManager.delete(account.id)
           if (removed) {

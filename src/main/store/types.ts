@@ -605,6 +605,13 @@ export interface ValidationResult {
   valid: boolean
   /** Error message */
   error?: string
+  /**
+   * True when the failure was caused by a connection-level problem
+   * (DNS failure, timeout, refused connection) instead of invalid
+   * credentials. Such failures must NOT trigger auto-deletion or
+   * status downgrades — they are transient.
+   */
+  networkError?: boolean
   /** Validation time */
   validatedAt: number
   /** Account info (returned when validation succeeds) */

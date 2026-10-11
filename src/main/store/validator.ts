@@ -403,6 +403,7 @@ export async function validateCredentials(
     return {
       valid: result.valid,
       error: result.error,
+      networkError: result.networkError,
       validatedAt: Date.now(),
       accountInfo: result.userInfo,
     }
