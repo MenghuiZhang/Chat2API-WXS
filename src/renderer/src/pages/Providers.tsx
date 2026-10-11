@@ -34,6 +34,23 @@ import type { ProviderVendor } from '@/types/electron'
 
 type ViewMode = 'providers' | 'accounts' | 'account-detail'
 
+/** Sleep that resolves early when `isCancelled` flips true (checked every 500ms). */
+const sleepInterruptible = (ms: number, isCancelled: () => boolean): Promise<void> =>
+  new Promise((resolve) => {
+    const step = 500
+    let elapsed = 0
+    const tick = (): void => {
+      if (isCancelled() || elapsed >= ms) {
+        resolve()
+        return
+      }
+      const next = Math.min(step, ms - elapsed)
+      elapsed += next
+      setTimeout(tick, next)
+    }
+    tick()
+  })
+
 export function Providers() {
   const { t } = useTranslation()
   const { toast } = useToast()
@@ -232,6 +249,7 @@ export function Providers() {
     }
 
     registeringRef.current = true
+    cancelBatchRef.current = false
     setIsRegistering(true)
     let succeeded = 0
     try {
@@ -245,20 +263,26 @@ export function Providers() {
 
       for (const request of qwenRequests) {
         for (let i = 0; i < request.count; i++) {
+          if (cancelBatchRef.current) break
           setRegisterStatus(
             t('providers.autoRefillStatus', { current: i + 1, total: request.count }),
           )
-          const ok = await registerOneAccount('qwen-ai')
+          const ok = await registerOneAccount('qwen-ai', () => cancelBatchRef.current)
+          if (cancelBatchRef.current) break
           if (ok) succeeded++
-          if (gapSeconds > 0 && i < request.count - 1) {
+          if (gapSeconds > 0 && i < request.count - 1 && !cancelBatchRef.current) {
             setRegisterStatus(t('providers.batchWaiting', { seconds: gapSeconds }))
-            await new Promise((resolve) => setTimeout(resolve, gapSeconds * 1000))
+            await sleepInterruptible(gapSeconds * 1000, () => cancelBatchRef.current)
           }
         }
+        if (cancelBatchRef.current) break
       }
 
+      const stopped = cancelBatchRef.current
       toast({
-        title: t('providers.autoRefillFinished'),
+        title: stopped
+          ? t('providers.batchStopped')
+          : t('providers.autoRefillFinished'),
         description: t('providers.autoRefillDone', {
           done: succeeded,
           total: qwenRequests.reduce((sum, r) => sum + r.count, 0),
@@ -752,7 +776,7 @@ export function Providers() {
       setBatchDone(i + 1)
       if (gapSeconds > 0 && i < count - 1 && !cancelBatchRef.current) {
         setRegisterStatus(t('providers.batchWaiting', { seconds: gapSeconds }))
-        await new Promise((resolve) => setTimeout(resolve, gapSeconds * 1000))
+        await sleepInterruptible(gapSeconds * 1000, () => cancelBatchRef.current)
       }
     }
     const cancelled = cancelBatchRef.current
@@ -1042,6 +1066,7 @@ export function Providers() {
           onOpenBatchRegister={() => setShowBatchRegister(true)}
           isRegistering={isRegistering}
           registerStatus={registerStatus}
+          onStopRegister={handleStopBatch}
           onBatchCheck={handleBatchCheck}
           isBatchChecking={isBatchChecking}
           batchCheckStatus={batchCheckStatus}

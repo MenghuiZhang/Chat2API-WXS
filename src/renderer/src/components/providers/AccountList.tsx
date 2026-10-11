@@ -63,6 +63,8 @@ interface AccountListProps {
   onOpenBatchRegister?: () => void
   isRegistering?: boolean
   registerStatus?: string
+  /** Stop the running registration flow (manual, batch or auto-refill) */
+  onStopRegister?: () => void
   /** Validate every account sequentially (main process) */
   onBatchCheck?: () => void
   isBatchChecking?: boolean
@@ -82,6 +84,7 @@ export function AccountList({
   onOpenBatchRegister,
   isRegistering,
   registerStatus,
+  onStopRegister,
   onBatchCheck,
   isBatchChecking,
   batchCheckStatus,
@@ -262,6 +265,12 @@ export function AccountList({
                   ? registerStatus || t('providers.registering')
                   : t('providers.registerAccount')}
               </Button>
+              {isRegistering && onStopRegister && (
+                <Button size="sm" variant="destructive" onClick={onStopRegister}>
+                  <X className="mr-2 h-4 w-4" />
+                  {t('providers.batchStop')}
+                </Button>
+              )}
             </>
           )}
           <Button size="sm" onClick={onAddAccount}>

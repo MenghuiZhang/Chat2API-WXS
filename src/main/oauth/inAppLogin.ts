@@ -43,6 +43,10 @@ const DEFAULT_TIMEOUT = 300000 // 5 minutes
 const MIN_LOGIN_TIME = 5000 // Minimum time before checking tokens (5 seconds)
 const MAX_LOAD_RETRIES = 3 // Maximum number of retry attempts for page loading
 const LOAD_RETRY_DELAY = 2000 // Delay between retry attempts (ms)
+// When the automatic registration flow fails, keep the window open for a
+// short grace period (so the user can finish manually), then auto-fail
+// instead of hanging until the full login timeout expires.
+const REGISTER_FAIL_GRACE_MS = 30000
 
 // Common User-Agent string for the in-app login window.
 // Many provider websites reject or block the default Electron User-Agent,
@@ -65,6 +69,7 @@ export class InAppLoginManager extends EventEmitter {
   private loadRetryCount: number = 0
   private tokenCheckRunning: boolean = false
   private tokenCheckQueued: boolean = false
+  private registerFailTimer: NodeJS.Timeout | null = null
 
   constructor() {
     super()
@@ -276,10 +281,24 @@ export class InAppLoginManager extends EventEmitter {
       .catch((error) => {
         console.error('[InAppLogin] Registration flow failed:', error)
         if (this.isCompleted) return
+        const message = error instanceof Error ? error.message : String(error)
         this.emit('status', {
           status: 'pending',
-          message: `自动注册失败: ${error instanceof Error ? error.message : String(error)} — 可在窗口中手动完成注册`,
+          message: `自动注册失败: ${message} — 可在窗口中手动完成注册`,
         })
+        // Do not leave the caller (batch/auto-refill loop) hanging until the
+        // full login timeout: auto-fail after a short grace period unless a
+        // token was captured (manual completion) in the meantime.
+        if (this.registerFailTimer) clearTimeout(this.registerFailTimer)
+        this.registerFailTimer = setTimeout(() => {
+          this.registerFailTimer = null
+          if (this.isCompleted || this.foundTokens.size > 0) return
+          console.log('[InAppLogin] Registration failure grace period expired; completing as failure')
+          this.complete({
+            success: false,
+            error: `自动注册失败: ${message}`,
+          })
+        }, REGISTER_FAIL_GRACE_MS)
       })
   }
 
@@ -881,6 +900,11 @@ export class InAppLoginManager extends EventEmitter {
   }
 
   private cleanup(): void {
+    if (this.registerFailTimer) {
+      clearTimeout(this.registerFailTimer)
+      this.registerFailTimer = null
+    }
+
     if (this.loginSession) {
       try {
         this.loginSession.webRequest.onBeforeSendHeaders(() => {})
