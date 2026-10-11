@@ -69,10 +69,13 @@ function adminHeaders(): Record<string, string> {
   }
 }
 
+/** Prefix used by `randomName()`; addresses starting with it are ours. */
+export const TEMP_ADDRESS_PREFIX = 'chat2api'
+
 function randomName(): string {
   const ts = Date.now().toString(36)
   const rand = Math.random().toString(36).slice(2, 8)
-  return `chat2api${ts}${rand}`
+  return `${TEMP_ADDRESS_PREFIX}${ts}${rand}`
 }
 
 /**
@@ -95,6 +98,81 @@ export async function createTempAddress(name?: string): Promise<TempAddress> {
     jwt: data.jwt || '',
     addressId: data.address_id ?? 0,
   }
+}
+
+export interface ExistingTempAddress {
+  address: string
+  addressId: number
+  mailCount: number
+  createdAt: string
+}
+
+/**
+ * List existing mailbox addresses via the admin API (newest first).
+ * `query` filters server-side by address substring (e.g. "chat2api").
+ */
+export async function listTempAddresses(query?: string, limit = 100): Promise<ExistingTempAddress[]> {
+  const cfg = requireTempMailConfig()
+  const resp = await axios.get(`${cfg.apiUrl.replace(/\/+$/, '')}/admin/address`, {
+    headers: adminHeaders(),
+    params: {
+      limit,
+      offset: 0,
+      ...(query ? { query } : {}),
+    },
+    timeout: 20000,
+  })
+  const results = (resp.data?.results || []) as Array<{
+    id?: number
+    name?: string
+    created_at?: string
+    mail_count?: number
+  }>
+  return results
+    .filter((r) => typeof r.name === 'string' && r.name.includes('@'))
+    .map((r) => ({
+      address: r.name as string,
+      addressId: r.id ?? 0,
+      mailCount: r.mail_count ?? 0,
+      createdAt: r.created_at || '',
+    }))
+}
+
+/**
+ * Return an existing, still-unused `chat2api*` mailbox when one is
+ * available; otherwise create a new one.
+ *
+ * "Unused" means no stored account has already registered with that email
+ * address (accounts keep the temp address in their `email` field). Mail
+ * polling uses the admin endpoint, so a reused address needs no JWT.
+ */
+export async function getOrCreateTempAddress(): Promise<TempAddress & { reused: boolean }> {
+  try {
+    const existing = await listTempAddresses(TEMP_ADDRESS_PREFIX)
+    const usedEmails = new Set(
+      storeManager
+        .getAccounts()
+        .map((a) => (a.email || '').trim().toLowerCase())
+        .filter(Boolean),
+    )
+    const free = existing.find((a) => !usedEmails.has(a.address.trim().toLowerCase()))
+    if (free) {
+      console.log(`[TempMail] Reusing existing mailbox: ${free.address}`)
+      return { address: free.address, jwt: '', addressId: free.addressId, reused: true }
+    }
+    if (existing.length > 0) {
+      console.log(
+        `[TempMail] All ${existing.length} existing chat2api mailbox(es) are already bound to accounts; creating a new one`,
+      )
+    }
+  } catch (e) {
+    console.warn(
+      '[TempMail] Failed to list existing addresses, falling back to creating a new one:',
+      e instanceof Error ? e.message : e,
+    )
+  }
+  const created = await createTempAddress()
+  return { ...created, reused: false }
 }
 
 /**

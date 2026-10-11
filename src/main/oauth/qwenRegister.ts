@@ -2,7 +2,9 @@
  * Qwen AI (chat.qwen.ai) automatic account registration.
  *
  * Flow:
- *  1. Create a temporary mailbox via the Cloudflare Temp Email admin API.
+ *  1. Obtain a temporary mailbox via the Cloudflare Temp Email admin API,
+ *     preferring to reuse an existing chat2api* address that is not yet
+ *     bound to a stored account; a new one is only created when none is free.
  *  2. Open the in-app login window at https://chat.qwen.ai/auth?mode=register.
  *  3. Fill the temp address into the register form and submit.
  *  4. Poll the temp mailbox for the 6-digit verification code email.
@@ -14,6 +16,7 @@
 import { WebContents } from 'electron'
 import {
   createTempAddress,
+  getOrCreateTempAddress,
   waitForVerificationCode,
 } from './tempMail'
 
@@ -158,40 +161,38 @@ async function dismissAgeDialog(wc: WebContents): Promise<void> {
 }
 
 /**
- * Run the full registration automation inside the already-open login window.
- * Throws on unrecoverable failures; the caller keeps the window open so the
- * user can finish manually.
+ * Fill the email input with `address`, submit it, then wait for the 6-digit
+ * code inputs to appear — their presence confirms Qwen accepted the address
+ * and sent the verification mail.
+ *
+ * Returns false when the address was rejected (already registered, rate
+ * limited, blocked domain, ...). Throws on page-level failures.
  */
-export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ address: string }> {
-  const { webContents: wc, emitStatus } = deps
-
-  // 1. Create the temp mailbox first so `sinceTs` predates the code email.
-  emitStatus('正在创建临时邮箱...')
-  const temp = await createTempAddress()
-  console.log('[QwenRegister] Temp address created:', temp.address)
-  emitStatus(`临时邮箱: ${temp.address}`)
-  const sinceTs = Date.now() - 5000
-
-  // 2. Navigate to the register page.
+async function submitEmailForCode(
+  wc: WebContents,
+  address: string,
+  emitStatus: (message: string) => void,
+): Promise<boolean> {
+  // Always start from a clean register page: a previously rejected attempt
+  // can leave the form in an error state where refilling does nothing.
   const currentUrl = wcAlive(wc) ? wc.getURL() : ''
   if (!currentUrl.includes('mode=register')) {
     emitStatus('正在打开注册页面...')
     await wc.loadURL(REGISTER_URL)
   }
 
-  // 3. Wait for the email input and fill it.
   emitStatus('正在填写邮箱...')
   const emailReady = await waitForCondition(wc, EMAIL_INPUT_JS, 30000)
   if (!emailReady) {
     throw new Error('注册页面加载失败：未找到邮箱输入框')
   }
-  const filled = await exec<boolean>(wc, fillNativeValueJs(temp.address))
+  const filled = await exec<boolean>(wc, fillNativeValueJs(address))
   if (!filled) {
     throw new Error('无法填写邮箱输入框')
   }
   await sleep(300)
 
-  // 4. Click 继续 to send the verification code.
+  // Click 继续 to send the verification code.
   const continueReady = await waitForCondition(wc, CONTINUE_BUTTON_JS, 10000)
   if (!continueReady) {
     throw new Error('未找到可用的「继续」按钮')
@@ -199,8 +200,42 @@ export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ add
   emitStatus('正在提交邮箱，等待验证码邮件...')
   await exec<boolean>(wc, `(function(){ const b = ${CONTINUE_BUTTON_JS}; if (b) { b.click(); return true } return false })()`)
 
-  // 5. Wait for the 6 digit inputs to appear (confirms the code was sent).
-  const digitsReady = await waitForCondition(wc, `${DIGIT_INPUTS_JS}.length >= 6`, 30000)
+  return waitForCondition(wc, `${DIGIT_INPUTS_JS}.length >= 6`, 30000)
+}
+
+/**
+ * Run the full registration automation inside the already-open login window.
+ * Throws on unrecoverable failures; the caller keeps the window open so the
+ * user can finish manually.
+ */
+export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ address: string }> {
+  const { webContents: wc, emitStatus } = deps
+
+  // 1. Obtain the temp mailbox first so `sinceTs` predates the code email.
+  //    Prefer reusing an existing chat2api* address that is not yet bound
+  //    to any stored account; only create a new one when none is free.
+  emitStatus('正在获取临时邮箱...')
+  let temp = await getOrCreateTempAddress()
+  console.log(`[QwenRegister] Temp address ${temp.reused ? 'reused' : 'created'}:`, temp.address)
+  emitStatus(`${temp.reused ? '复用临时邮箱' : '临时邮箱'}: ${temp.address}`)
+  let sinceTs = Date.now() - 5000
+
+  // 2-5. Fill the address and submit it, waiting for the code inputs.
+  let digitsReady = await submitEmailForCode(wc, temp.address, emitStatus)
+
+  // A reused mailbox may already be registered on Qwen's side even though
+  // no stored account references it (e.g. the account was deleted). Fall
+  // back to a brand-new address once before giving up.
+  if (!digitsReady && temp.reused) {
+    console.warn('[QwenRegister] Reused address was rejected, creating a new one:', temp.address)
+    emitStatus('复用的邮箱可能已被注册，正在新建邮箱重试...')
+    temp = { ...(await createTempAddress()), reused: false }
+    console.log('[QwenRegister] Temp address created:', temp.address)
+    emitStatus(`临时邮箱: ${temp.address}`)
+    sinceTs = Date.now() - 5000
+    digitsReady = await submitEmailForCode(wc, temp.address, emitStatus)
+  }
+
   if (!digitsReady) {
     // The page may show an error (e.g. address rejected / rate limit)
     throw new Error('提交邮箱后未出现验证码输入框，注册可能被拒绝')
