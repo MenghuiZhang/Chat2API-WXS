@@ -6,8 +6,9 @@
  * requiring the user to run a separate Clash client, we embed the mihomo
  * (Clash Meta) core as a child process:
  *
- *   1. Download mihomo-windows-<arch>.zip from the official GitHub release
- *      once into <userData>/clash-core/ (override with CHAT2API_MIHOMO_ZIP_URL).
+ *   1. Download the mihomo release asset for the current platform once into
+ *      <userData>/clash-core/ (zip on Windows, single-binary gz elsewhere;
+ *      override with CHAT2API_MIHOMO_ZIP_URL).
  *   2. Download the Clash subscription YAML and prepend a mixed-port header.
  *   3. Spawn `mihomo -d <workDir> -f <config>` and wait for the mixed port.
  *   4. The rest of the app treats http://127.0.0.1:<port> as upstream proxy.
@@ -47,7 +48,7 @@ function workDir(): string {
 }
 
 function binaryPath(): string {
-  return path.join(workDir(), 'mihomo.exe')
+  return path.join(workDir(), process.platform === 'win32' ? 'mihomo.exe' : 'mihomo')
 }
 
 function archTag(): string {
@@ -74,11 +75,27 @@ function findFreePort(): Promise<number> {
   })
 }
 
-/** Pick the plain (non go1xx / non vN-microarch) windows zip from asset names. */
-function pickWindowsZip(names: string[]): string {
-  const re = new RegExp(`^mihomo-windows-${archTag()}-.*\\.zip$`)
-  const candidates = names.filter((n) => re.test(n) && !/-go1\d\d/.test(n) && !/-v[123]-/.test(n))
-  return candidates[0] || ''
+/** Release asset OS tag for the current platform. */
+function osTag(): string {
+  switch (process.platform) {
+    case 'win32':
+      return 'windows'
+    case 'darwin':
+      return 'darwin'
+    default:
+      return 'linux'
+  }
+}
+
+/** Release archive extension: zip on Windows, single-binary gz elsewhere. */
+function assetExt(): string {
+  return process.platform === 'win32' ? 'zip' : 'gz'
+}
+
+/** Pick the plain release asset (e.g. mihomo-linux-amd64-v1.19.32.gz). */
+function pickAsset(names: string[]): string {
+  const re = new RegExp(`^mihomo-${osTag()}-${archTag()}-v[\\d.]+\\.${assetExt()}$`)
+  return names.find((n) => re.test(n)) || ''
 }
 
 /** Fallback (no api.github.com): scrape the releases page for the asset URL. */
@@ -102,8 +119,10 @@ async function resolveZipUrlViaHtml(): Promise<string> {
     transformResponse: [(d) => d],
     headers: { 'User-Agent': 'chat2api' },
   })
-  const names = [...String(assets.data || '').matchAll(/(mihomo-windows-[\w.-]+\.zip)/g)].map((m) => m[1])
-  const zip = pickWindowsZip([...new Set(names)])
+  const names = [...String(assets.data || '').matchAll(/(mihomo-(?:windows|linux|darwin)-[\w.-]+\.(?:zip|gz))/g)].map(
+    (m) => m[1]
+  )
+  const zip = pickAsset([...new Set(names)])
   return zip ? `https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${zip}` : ''
 }
 
@@ -124,7 +143,7 @@ async function ensureBinary(): Promise<{ ok: boolean; error?: string }> {
         headers: { 'User-Agent': 'chat2api', Accept: 'application/vnd.github+json' },
       })
       const assets: Array<{ name?: string; browser_download_url?: string }> = api.data?.assets || []
-      const zip = pickWindowsZip(assets.map((a) => a.name || ''))
+      const zip = pickAsset(assets.map((a) => a.name || ''))
       zipUrl = assets.find((a) => a.name === zip)?.browser_download_url || ''
     } catch {
       /* fall through to HTML fallback below */
@@ -140,11 +159,11 @@ async function ensureBinary(): Promise<{ ok: boolean; error?: string }> {
   if (!zipUrl) {
     return {
       ok: false,
-      error: `无法获取 mihomo 下载地址（GitHub 不可达）。可手动下载 mihomo-windows-${archTag()}.zip 并将 mihomo.exe 放入 ${dir}，或设置环境变量 CHAT2API_MIHOMO_ZIP_URL`,
+      error: `无法获取 mihomo 下载地址（GitHub 不可达）。可手动下载 mihomo-${osTag()}-${archTag()} 发布包（.${assetExt()}）并将内核重命名为 ${path.basename(bin)} 放入 ${dir}，或设置环境变量 CHAT2API_MIHOMO_ZIP_URL`,
     }
   }
 
-  const zipPath = path.join(dir, 'mihomo.zip')
+  const zipPath = path.join(dir, 'mihomo-core' + (/\.gz(\?|$)/.test(zipUrl) ? '.gz' : '.zip'))
   try {
     const resp = await axios.get(zipUrl, {
       timeout: 120000,
@@ -158,41 +177,66 @@ async function ensureBinary(): Promise<{ ok: boolean; error?: string }> {
     return { ok: false, error: `mihomo 核心下载失败: ${e instanceof Error ? e.message : String(e)}` }
   }
 
-  // Extract with PowerShell (Windows-only app).
+  // Extract: .gz archives hold the single binary; .zip needs unpacking.
   const extractDir = path.join(dir, 'extracted')
   fs.rmSync(extractDir, { recursive: true, force: true })
-  await new Promise<void>((resolve, reject) => {
-    execFile(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-Command',
-        `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${extractDir}' -Force`,
-      ],
-      { timeout: 60000 },
-      (err) => (err ? reject(err) : resolve())
-    )
-  }).catch((e) => {
-    throw new Error(`解压 mihomo 失败: ${e instanceof Error ? e.message : String(e)}`)
-  })
-
-  // Locate the executable inside the extracted tree and move it into place.
-  const found: string[] = []
-  const walk = (d: string) => {
-    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, entry.name)
-      if (entry.isDirectory()) walk(p)
-      else if (entry.name.toLowerCase().endsWith('.exe')) found.push(p)
+  try {
+    if (zipPath.endsWith('.gz')) {
+      const zlib = await import('node:zlib')
+      fs.writeFileSync(bin, zlib.gunzipSync(fs.readFileSync(zipPath)))
+    } else {
+      fs.mkdirSync(extractDir, { recursive: true })
+      if (process.platform === 'win32') {
+        await new Promise<void>((resolve, reject) => {
+          execFile(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${extractDir}' -Force`,
+            ],
+            { timeout: 60000 },
+            (err) => (err ? reject(err) : resolve())
+          )
+        })
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          execFile('unzip', ['-o', zipPath, '-d', extractDir], { timeout: 60000 }, (err) =>
+            err ? reject(err) : resolve()
+          )
+        })
+      }
+      // Locate the executable inside the extracted tree and move it into place.
+      const found: string[] = []
+      const walk = (d: string) => {
+        for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+          const p = path.join(d, entry.name)
+          if (entry.isDirectory()) walk(p)
+          else found.push(p)
+        }
+      }
+      walk(extractDir)
+      const exe =
+        found.find((f) => path.basename(f).toLowerCase().includes('mihomo')) ||
+        found.find((f) => !path.extname(f)) ||
+        found[0]
+      if (!exe) {
+        return { ok: false, error: '解压后未找到 mihomo 可执行文件' }
+      }
+      fs.copyFileSync(exe, bin)
+      fs.rmSync(extractDir, { recursive: true, force: true })
+    }
+  } catch (e) {
+    return { ok: false, error: `解压 mihomo 失败: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(bin, 0o755)
+    } catch {
+      /* ignore */
     }
   }
-  walk(extractDir)
-  const exe = found[0]
-  if (!exe) {
-    return { ok: false, error: '解压后未找到 mihomo 可执行文件' }
-  }
-  fs.copyFileSync(exe, bin)
   fs.rmSync(zipPath, { force: true })
-  fs.rmSync(extractDir, { recursive: true, force: true })
   return { ok: true }
 }
 
