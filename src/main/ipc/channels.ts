@@ -69,6 +69,15 @@ export const IpcChannels = {
   TEMP_MAIL_TEST: 'tempMail:test',
   TEMP_MAIL_IS_CONFIGURED: 'tempMail:isConfigured',
 
+  GEEPASS_GET_CONFIG: 'geepass:getConfig',
+  GEEPASS_UPDATE_CONFIG: 'geepass:updateConfig',
+  GEEPASS_TEST: 'geepass:test',
+
+  UPSTREAM_PROXY_GET_CONFIG: 'upstreamProxy:getConfig',
+  UPSTREAM_PROXY_UPDATE_CONFIG: 'upstreamProxy:updateConfig',
+  UPSTREAM_PROXY_TEST: 'upstreamProxy:test',
+  UPSTREAM_PROXY_PARSE_SUBSCRIPTION: 'upstreamProxy:parseSubscription',
+
   LOGS_GET: 'logs:get',
   LOGS_GET_STATS: 'logs:getStats',
   LOGS_GET_TREND: 'logs:getTrend',

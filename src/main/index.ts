@@ -5,6 +5,8 @@ import { createTrayManager, TrayManager } from './tray/TrayManager'
 import { registerIpcHandlers } from './ipc/handlers'
 import { UpdaterManager } from './updater'
 import { storeManager } from './store/store'
+import { installAxiosUpstreamProxy } from './lib/clashProxy'
+import { syncEmbeddedClash, stopEmbeddedClash } from './lib/embeddedClash'
 
 // Prevent uncaught exceptions from crashing the app
 process.on('uncaughtException', (error) => {
@@ -121,6 +123,10 @@ async function initializeApp(): Promise<void> {
 }
 
 async function setupApp(): Promise<void> {
+  // Route outbound axios requests through the configured upstream proxy
+  // (manual URL or local Clash client) when the feature is enabled.
+  installAxiosUpstreamProxy()
+
   const mainWindow = createWindow({
     width: 1200,
     height: 800,
@@ -131,6 +137,10 @@ async function setupApp(): Promise<void> {
   })
 
   await registerIpcHandlers(mainWindow)
+
+  // Start/stop the embedded mihomo core to match the saved config
+  // (must run after storage initialization inside registerIpcHandlers).
+  void syncEmbeddedClash()
 
   trayManager = createTrayManager(mainWindow)
 
@@ -161,6 +171,7 @@ async function loadAppContent(mainWindow: BrowserWindow): Promise<void> {
 
 function cleanup(): void {
   console.log('Application is exiting, performing cleanup...')
+  stopEmbeddedClash()
   storeManager.flushPendingWrites()
   const updaterManager = UpdaterManager.getInstance()
   updaterManager.destroy()

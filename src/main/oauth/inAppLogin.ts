@@ -8,6 +8,7 @@ import { EventEmitter } from 'events'
 import { ProviderType } from './types'
 import { TokenExtractionConfig, getTokenExtractionConfig, TokenSource } from './tokenExtractionConfig'
 import { runQwenRegistration, QWEN_REGISTER_URL } from './qwenRegister'
+import { applySessionProxy } from '../lib/clashProxy'
 
 export interface InAppLoginResult {
   success: boolean
@@ -125,11 +126,22 @@ export class InAppLoginManager extends EventEmitter {
     // blocked by provider websites that reject Electron's default UA.
     this.loginSession.setUserAgent(IN_APP_LOGIN_UA)
 
-    if (this.options?.proxyMode === 'none') {
-      this.loginSession.setProxy({ mode: 'direct' }).catch((error) => {
-        console.error('[InAppLogin] Failed to set direct proxy:', error)
+    // Apply the configured upstream proxy (manual URL or local Clash client)
+    // to the login session so registration/login egresses through it. When
+    // upstream proxy is disabled keep the legacy behavior: 'none' forces a
+    // direct connection, otherwise the system proxy is used.
+    applySessionProxy(this.loginSession)
+      .then((info) => {
+        if (!info.active && this.options?.proxyMode === 'none') {
+          return this.loginSession?.setProxy({ mode: 'direct' })
+        }
+        if (info.active) {
+          console.log(`[InAppLogin] Upstream proxy applied: ${info.url} (${info.source})`)
+        }
       })
-    }
+      .catch((error) => {
+        console.error('[InAppLogin] Failed to set proxy:', error)
+      })
 
     this.loginWindow = new BrowserWindow({
       width: 500,

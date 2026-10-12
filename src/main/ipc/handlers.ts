@@ -37,7 +37,15 @@ import { PerplexityAdapter } from '../proxy/adapters/perplexity'
 import { QwenAdapter } from '../proxy/adapters/qwen'
 import { QwenAiAdapter } from '../proxy/adapters/qwen-ai'
 import { ZaiAdapter } from '../proxy/adapters/zai'
-import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, TempMailConfig } from '../../shared/types'
+import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, TempMailConfig, GeepassConfig, UpstreamProxyConfig, UpstreamProxyInfo, ClashProxyNode } from '../../shared/types'
+import { testGeepassToken } from '../lib/geepass'
+import {
+  fetchClashSubscription,
+  resolveUpstreamProxy,
+  invalidateUpstreamProxyCache,
+  checkUrlThroughProxy,
+} from '../lib/clashProxy'
+import { syncEmbeddedClash } from '../lib/embeddedClash'
 import type { SystemPrompt, SessionConfig, SessionRecord, ManagementApiConfig } from '../store/types'
 import type { ProviderType } from '../oauth/types'
 
@@ -845,6 +853,97 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
       }
     }
   })
+
+  // ==================== Geepass (captcha recognition) Handlers ====================
+
+  ipcMain.handle(IpcChannels.GEEPASS_GET_CONFIG, async (): Promise<GeepassConfig> => {
+    const stored = (storeManager.getConfig() as { geepass?: Partial<GeepassConfig> }).geepass
+    return {
+      enabled: stored?.enabled ?? false,
+      token: stored?.token || '',
+      type: stored?.type === 20111 ? 20111 : 20110,
+    }
+  })
+
+  ipcMain.handle(IpcChannels.GEEPASS_UPDATE_CONFIG, async (_, updates: Partial<GeepassConfig>): Promise<GeepassConfig> => {
+    const current = (storeManager.getConfig() as { geepass?: Partial<GeepassConfig> }).geepass || {}
+    const merged: GeepassConfig = {
+      enabled: updates.enabled !== undefined ? updates.enabled : (current.enabled ?? false),
+      token: updates.token !== undefined ? updates.token.trim() : (current.token || ''),
+      type: updates.type !== undefined ? updates.type : (current.type === 20111 ? 20111 : 20110),
+    }
+    ConfigManager.update({ geepass: merged })
+    return merged
+  })
+
+  ipcMain.handle(IpcChannels.GEEPASS_TEST, async (): Promise<{ success: boolean; message: string }> => {
+    try {
+      const stored = (storeManager.getConfig() as { geepass?: Partial<GeepassConfig> }).geepass
+      return await testGeepassToken(stored?.token || '')
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  // ==================== Upstream Proxy (Clash) Handlers ====================
+
+  ipcMain.handle(IpcChannels.UPSTREAM_PROXY_GET_CONFIG, async (): Promise<UpstreamProxyConfig> => {
+    const stored = (storeManager.getConfig() as { upstreamProxy?: Partial<UpstreamProxyConfig> }).upstreamProxy
+    return {
+      enabled: stored?.enabled ?? false,
+      source: stored?.source === 'manual' ? 'manual' : stored?.source === 'embedded' ? 'embedded' : 'clash',
+      manualUrl: stored?.manualUrl || '',
+      subscriptionUrl: stored?.subscriptionUrl || '',
+      mixedPort: stored?.mixedPort,
+      selectedNode: stored?.selectedNode || '',
+    }
+  })
+
+  ipcMain.handle(IpcChannels.UPSTREAM_PROXY_UPDATE_CONFIG, async (_, updates: Partial<UpstreamProxyConfig>): Promise<UpstreamProxyConfig> => {
+    const current = (storeManager.getConfig() as { upstreamProxy?: Partial<UpstreamProxyConfig> }).upstreamProxy || {}
+    const merged: UpstreamProxyConfig = {
+      enabled: updates.enabled !== undefined ? updates.enabled : (current.enabled ?? false),
+      source: updates.source !== undefined ? updates.source : (current.source === 'manual' ? 'manual' : current.source === 'embedded' ? 'embedded' : 'clash'),
+      manualUrl: updates.manualUrl !== undefined ? updates.manualUrl.trim() : (current.manualUrl || ''),
+      subscriptionUrl: updates.subscriptionUrl !== undefined ? updates.subscriptionUrl.trim() : (current.subscriptionUrl || ''),
+      mixedPort: updates.mixedPort !== undefined ? updates.mixedPort : current.mixedPort,
+      selectedNode: updates.selectedNode !== undefined ? updates.selectedNode : (current.selectedNode || ''),
+    }
+    ConfigManager.update({ upstreamProxy: merged })
+    invalidateUpstreamProxyCache()
+    void syncEmbeddedClash()
+    return merged
+  })
+
+  ipcMain.handle(IpcChannels.UPSTREAM_PROXY_TEST, async (): Promise<UpstreamProxyInfo> => {
+    try {
+      invalidateUpstreamProxyCache()
+      const info = await resolveUpstreamProxy()
+      if (info.active && info.url) {
+        // Verify real connectivity through the candidate proxy.
+        const ok = await checkUrlThroughProxy(info.url, 'https://chat.qwen.ai')
+        if (!ok) {
+          return { ...info, active: false, message: `代理 ${info.url} 无法连通目标站点` }
+        }
+      }
+      return info
+    } catch (error) {
+      return { active: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle(
+    IpcChannels.UPSTREAM_PROXY_PARSE_SUBSCRIPTION,
+    async (_, url?: string): Promise<{ nodeCount: number; nodes: ClashProxyNode[]; mixedPort?: number; error?: string }> => {
+      const target = (url || '').trim() ||
+        ((storeManager.getConfig() as { upstreamProxy?: Partial<UpstreamProxyConfig> }).upstreamProxy?.subscriptionUrl || '').trim()
+      if (!target) {
+        return { nodeCount: 0, nodes: [], error: '请先填写订阅地址' }
+      }
+      const info = await fetchClashSubscription(target)
+      return { nodeCount: info.nodeCount, nodes: info.nodes, mixedPort: info.mixedPort, error: info.error }
+    }
+  )
 
   ipcMain.handle(IpcChannels.OAUTH_VALIDATE_TOKEN, async (_, data: { providerId: string, providerType: ProviderVendor, credentials: Record<string, string> }) => {
     return await oauthManager.validateToken(data.providerId, data.providerType as ProviderType, data.credentials)

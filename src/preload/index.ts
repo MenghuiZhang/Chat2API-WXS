@@ -13,6 +13,10 @@ import type {
   ProviderVendor,
   AppConfig,
   TempMailConfig,
+  GeepassConfig,
+  UpstreamProxyConfig,
+  UpstreamProxyInfo,
+  ClashProxyNode,
   SystemPrompt,
   PromptType,
   EffectiveModel,
@@ -306,6 +310,33 @@ const tempMailAPI = {
 
   isConfigured: (): Promise<boolean> =>
     ipcRenderer.invoke(IpcChannels.TEMP_MAIL_IS_CONFIGURED),
+}
+
+const geepassAPI = {
+  getConfig: (): Promise<GeepassConfig> =>
+    ipcRenderer.invoke(IpcChannels.GEEPASS_GET_CONFIG),
+
+  updateConfig: (updates: Partial<GeepassConfig>): Promise<GeepassConfig> =>
+    ipcRenderer.invoke(IpcChannels.GEEPASS_UPDATE_CONFIG, updates),
+
+  test: (): Promise<{ success: boolean; message: string }> =>
+    ipcRenderer.invoke(IpcChannels.GEEPASS_TEST),
+}
+
+const upstreamProxyAPI = {
+  getConfig: (): Promise<UpstreamProxyConfig> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_GET_CONFIG),
+
+  updateConfig: (updates: Partial<UpstreamProxyConfig>): Promise<UpstreamProxyConfig> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_UPDATE_CONFIG, updates),
+
+  test: (): Promise<UpstreamProxyInfo> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_TEST),
+
+  parseSubscription: (
+    url?: string
+  ): Promise<{ nodeCount: number; nodes: ClashProxyNode[]; mixedPort?: number; error?: string }> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_PARSE_SUBSCRIPTION, url),
 }
 
 interface LogFilter {
@@ -751,6 +782,8 @@ const electronAPI = {
   accounts: accountsAPI,
   oauth: oauthAPI,
   tempMail: tempMailAPI,
+  geepass: geepassAPI,
+  upstreamProxy: upstreamProxyAPI,
   logs: logsAPI,
   requestLogs: requestLogsAPI,
   statistics: statisticsAPI,

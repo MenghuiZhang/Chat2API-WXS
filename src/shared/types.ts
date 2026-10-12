@@ -133,6 +133,73 @@ export interface AppConfig {
   targetAccountCount?: number
   /** Temporary mailbox settings for the Qwen AI auto-registration flow */
   tempMail?: TempMailConfig
+  /** Geepass captcha-recognition settings used by the captcha window */
+  geepass?: GeepassConfig
+  /** Upstream proxy settings (manual URL or Clash subscription auto-detect) */
+  upstreamProxy?: UpstreamProxyConfig
+}
+
+/**
+ * Geepass (geepass.cn) captcha-recognition service configuration.
+ * Used to solve slide/puzzle captchas inside the in-app captcha window.
+ */
+export interface GeepassConfig {
+  /** Whether Geepass recognition is enabled */
+  enabled: boolean
+  /** User token from the Geepass console */
+  token: string
+  /**
+   * Recognition type:
+   * - 20110: single-image gap detection (background only)
+   * - 20111: two-image slider (slider image + background image)
+   */
+  type: 20110 | 20111
+}
+
+/**
+ * Upstream proxy configuration for login/captcha windows and outbound
+ * axios requests. Either a manually specified proxy URL or automatic
+ * detection of a local Clash client, optionally validated against a
+ * Clash subscription link.
+ */
+export interface UpstreamProxyConfig {
+  /** Whether the upstream proxy feature is enabled */
+  enabled: boolean
+  /** Where the proxy comes from:
+   *  - manual: user-specified http/socks5 URL
+   *  - clash: auto-detect a running local Clash client mixed port
+   *  - embedded: dial subscription nodes with the built-in mihomo core */
+  source: 'manual' | 'clash' | 'embedded'
+  /** Manual proxy URL, e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:7891 */
+  manualUrl?: string
+  /** Clash subscription URL (informational + node listing) */
+  subscriptionUrl?: string
+  /** Override for the Clash mixed port (auto-detected when empty) */
+  mixedPort?: number
+  /** Name of the subscription node the embedded core should dial (empty = subscription default) */
+  selectedNode?: string
+}
+
+/** A single proxy node parsed from a Clash subscription */
+export interface ClashProxyNode {
+  name: string
+  type: string
+  server: string
+  port: number
+  /** Whether this node type can be dialed directly by the app (http/socks only) */
+  usable: boolean
+}
+
+/** Result of resolving the effective upstream proxy */
+export interface UpstreamProxyInfo {
+  /** Whether a usable proxy was found */
+  active: boolean
+  /** Effective proxy URL (http/https/socks5) */
+  url?: string
+  /** Human-readable source description */
+  source?: string
+  /** Error/detail message when inactive */
+  message?: string
 }
 
 /**

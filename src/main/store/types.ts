@@ -3,7 +3,7 @@
  * Defines core data structures for accounts, providers, and configuration
  */
 
-import type { ProviderStatus, TempMailConfig } from '../../shared/types'
+import type { ProviderStatus, TempMailConfig, GeepassConfig, UpstreamProxyConfig } from '../../shared/types'
 import type { LegacyToolPromptConfig, ToolCallingConfig } from '../../shared/toolCalling.ts'
 import { DEFAULT_TOOL_CALLING_CONFIG } from '../../shared/toolCalling.ts'
 
@@ -262,6 +262,10 @@ export interface AppConfig {
   targetAccountCount?: number
   /** Temporary mailbox settings for the Qwen AI auto-registration flow */
   tempMail?: TempMailConfig
+  /** Geepass captcha-recognition settings used by the captcha window */
+  geepass?: GeepassConfig
+  /** Upstream proxy settings (manual URL or Clash subscription auto-detect) */
+  upstreamProxy?: UpstreamProxyConfig
 }
 
 /**
@@ -896,6 +900,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   autoRefillAccounts: false,
   targetAccountCount: 0,
   tempMail: undefined,
+  geepass: { enabled: false, token: '', type: 20110 },
+  upstreamProxy: { enabled: false, source: 'clash' },
 }
 
 /**
