@@ -2,6 +2,12 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
+## [1.7.1] - 2026-10-12
+
+### 🐛 修复 (Bug Fixes)
+
+- 修复内嵌 mihomo 核心在 Linux / macOS 上无法使用的问题：此前内核下载与解压逻辑为 Windows 专属（powershell.exe 解压、`.exe` 二进制名、windows zip 资产），Linux 端报 `解压 mihomo 失败: spawn powershell.exe ENOENT`。现在按平台选择对应发布资产（Windows 取 zip；Linux / macOS 取单二进制 `.gz`，用 node 内置 zlib 直接解压、不依赖任何外部命令；zip 在非 Windows 平台回退 `unzip`），二进制名按平台区分（`mihomo` / `mihomo.exe`），非 Windows 平台解压后自动赋予可执行权限（chmod 755）
+
 ## [1.7.0] - 2026-10-12
 
 ### ✨ 新功能 (Features)
