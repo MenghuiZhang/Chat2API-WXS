@@ -32,6 +32,10 @@ export interface PuzzleGeometry {
   slideImage?: string
   /** Background left edge X in main-frame viewport coordinates */
   bgOffsetX: number
+  /** How the drag handle was detected (selector/text/structure) — diagnostics */
+  handleFound?: string
+  /** How the background bytes were obtained (canvas/dataurl/fetch) */
+  bgVia?: string
 }
 
 /**
@@ -41,8 +45,23 @@ export interface PuzzleGeometry {
  */
 export function puzzleProbeScript(): string {
   return `
-    (() => {
-      // Candidate drag handles for the Aliyun puzzle slider.
+    (async () => {
+      const vis = (el) => {
+        if (!el) return false;
+        const b = el.getBoundingClientRect();
+        if (b.width < 5 || b.height < 5) return false;
+        const st = getComputedStyle(el);
+        return st.visibility !== 'hidden' && st.display !== 'none';
+      };
+
+      // --- Background candidates: landscape img/canvas --------------------
+      const bgCands = Array.from(document.querySelectorAll('img, canvas')).filter((el) => {
+        const b = el.getBoundingClientRect();
+        return b.width >= 120 && b.height >= 60 && (b.width / b.height) > 1.4 && vis(el);
+      });
+      if (!bgCands.length) return { error: 'no-bg' };
+
+      // --- 1. Known selectors ---------------------------------------------
       const handleSelectors = [
         '.nc-lang-cnt [class*="btn_slide"]',
         '[class*="slidetounlock"] [class*="btn"]',
@@ -51,39 +70,96 @@ export function puzzleProbeScript(): string {
         '.nc_iconfont.btn_slide',
         '[class*="slide-btn"]',
         '[class*="slider-btn"]',
+        '[class*="slide_btn"]',
+        '[class*="btn-slide"]',
         '[class*="drag"]',
       ];
       let handle = null;
+      let how = 'selector';
       for (const s of handleSelectors) {
-        const el = document.querySelector(s);
-        if (el) { const b = el.getBoundingClientRect(); if (b.width >= 5 && b.height >= 5) { handle = el; break; } }
+        let els = [];
+        try { els = Array.from(document.querySelectorAll(s)); } catch (e) { els = []; }
+        for (const el of els) { if (vis(el)) { handle = el; break; } }
+        if (handle) break;
       }
-      if (!handle) return null;
 
-      // Locate the puzzle background: canvas or img near the handle.
-      let bg = null;
-      const canvases = Array.from(document.querySelectorAll('canvas'));
-      for (const c of canvases) {
-        const b = c.getBoundingClientRect();
-        if (b.width > 100 && b.height > 60) { bg = c; break; }
-      }
-      if (!bg) {
-        const imgs = Array.from(document.querySelectorAll('img'));
-        for (const im of imgs) {
-          const b = im.getBoundingClientRect();
-          if (b.width > 100 && b.height > 60 && (b.width / b.height) > 1.5) { bg = im; break; }
+      // --- 2. Text scan: the hint line sits inside / next to the track ----
+      if (!handle && document.body) {
+        how = 'text';
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          const t = (node.nodeValue || '').trim();
+          if (!t || t.length > 40) continue;
+          if (!/拖动滑块|滑动完成|向右滑动|drag.*slider|slide.*complete|slide.*verify/i.test(t)) continue;
+          let el = node.parentElement;
+          for (let up = 0; up < 5 && el; up++) {
+            const b = el.getBoundingClientRect();
+            if (b.width > 120 && b.height >= 24 && b.height <= 90) {
+              const kids = Array.from(el.querySelectorAll('*')).filter((c) => {
+                const cb = c.getBoundingClientRect();
+                return cb.width >= 18 && cb.width <= 90 && cb.height >= 18 && cb.height <= 90 && vis(c);
+              });
+              if (kids.length) {
+                kids.sort((a, b2) => a.getBoundingClientRect().x - b2.getBoundingClientRect().x);
+                handle = kids[0];
+                break;
+              }
+            }
+            el = el.parentElement;
+          }
+          if (handle) break;
         }
       }
-      if (!bg) return null;
+
+      // --- 3. Structural scan near the background: square knob in a bar ---
+      if (!handle) {
+        how = 'structure';
+        const bgRects = bgCands.map((el) => el.getBoundingClientRect());
+        const near = (b) => bgRects.some((r) => {
+          const dy = Math.max(r.top - b.bottom, b.top - r.bottom, 0);
+          const dx = Math.max(r.left - b.right, b.left - r.right, 0);
+          return dy < 350 && dx < 200;
+        });
+        const bars = Array.from(document.querySelectorAll('div,section,span')).filter((el) => {
+          const b = el.getBoundingClientRect();
+          return b.width > 150 && b.height >= 26 && b.height <= 70 && (b.width / b.height) > 3 && vis(el) && near(b);
+        });
+        for (const bar of bars) {
+          const kids = Array.from(bar.querySelectorAll('*')).filter((c) => {
+            const cb = c.getBoundingClientRect();
+            const ratio = cb.width / Math.max(1, cb.height);
+            return cb.width >= 18 && cb.width <= 80 && ratio > 0.6 && ratio < 1.7 && vis(c);
+          });
+          if (kids.length) {
+            kids.sort((a, b2) => a.getBoundingClientRect().x - b2.getBoundingClientRect().x);
+            handle = kids[0];
+            break;
+          }
+        }
+      }
+      if (!handle) return { error: 'no-handle', bgFound: bgCands.length };
 
       const hb = handle.getBoundingClientRect();
+      const dist = (el) => {
+        const b = el.getBoundingClientRect();
+        const dx = Math.max(b.left - hb.right, hb.left - b.right, 0);
+        const dy = Math.max(b.top - hb.bottom, hb.top - b.bottom, 0);
+        return Math.hypot(dx, dy);
+      };
+      bgCands.sort((a, b) => dist(a) - dist(b));
+      const bg = bgCands[0];
       const bgb = bg.getBoundingClientRect();
-      const track = handle.closest('.slidetounlock, .nc-lang-cnt, [class*="track"]') || handle.parentElement;
+
+      const track =
+        handle.closest('.slidetounlock, .nc-lang-cnt, [class*="track"], [class*="slider"]') ||
+        handle.parentElement;
       const tb = track ? track.getBoundingClientRect() : bgb;
 
-      // Extract base64 images. Geepass requires width/height within
-      // [50, 1024], so downscale (or upscale tiny pieces) to fit and report
-      // the SUBMITTED width so the main process can scale coordinates back.
+      // --- Image extraction with fallbacks ---------------------------------
+      // Geepass requires width/height within [50, 1024]; downscale (or
+      // upscale tiny pieces) to fit and report the SUBMITTED width so the
+      // main process can scale coordinates back.
       const MAXD = 1024, MIND = 50;
       const fitScale = (w, h) => {
         let s = Math.min(MAXD / w, MAXD / h, 1);
@@ -91,40 +167,60 @@ export function puzzleProbeScript(): string {
         if (s < sMin) s = sMin;
         return s;
       };
-      const grab = (el, natW, natH, scaleOverride) => {
-        const s = scaleOverride || fitScale(natW, natH);
+      const draw = (el, natW, natH, s) => {
         const c = document.createElement('canvas');
         c.width = Math.max(1, Math.round(natW * s));
         c.height = Math.max(1, Math.round(natH * s));
         c.getContext('2d').drawImage(el, 0, 0, c.width, c.height);
-        return { b64: c.toDataURL('image/png').split(',')[1] || '', w: c.width };
+        return c.toDataURL('image/png').split(',')[1] || '';
+      };
+      // Fallback when drawImage throws (tainted canvas) or yields nothing:
+      // hand the ORIGINAL bytes over; the main process then decodes the real
+      // pixel width from the image header and scales coordinates itself.
+      const grab = async (el, natW, natH, s) => {
+        let b64 = '';
+        try { b64 = draw(el, natW, natH, s); } catch (e) { b64 = ''; }
+        if (b64 && b64.length > 100) return { b64, w: Math.max(1, Math.round(natW * s)), via: 'canvas' };
+        if (el.tagName === 'IMG') {
+          const src = el.currentSrc || el.src || '';
+          if (src.startsWith('data:')) {
+            const i = src.indexOf(',');
+            if (i > 0) return { b64: src.slice(i + 1), w: 0, via: 'dataurl' };
+          } else if (/^https?:/.test(src)) {
+            try {
+              const resp = await fetch(src, { credentials: 'include' });
+              if (resp.ok) {
+                const buf = await resp.arrayBuffer();
+                let bin = '';
+                const u8 = new Uint8Array(buf);
+                for (let i = 0; i < u8.length; i += 0x8000) {
+                  bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+                }
+                return { b64: btoa(bin), w: 0, via: 'fetch' };
+              }
+            } catch (e) { /* cors; fall through */ }
+          }
+        }
+        return { b64: '', w: 0, via: 'none' };
       };
 
-      let bgImage = '';
-      let bgSubmittedWidth = 0;
-      let bgScale = 1;
-      try {
-        const natW = bg.tagName === 'CANVAS' ? bg.width : (bg.naturalWidth || bgb.width);
-        const natH = bg.tagName === 'CANVAS' ? bg.height : (bg.naturalHeight || bgb.height);
-        bgScale = fitScale(natW, natH);
-        const g = grab(bg, natW, natH, bgScale);
-        bgImage = g.b64;
-        bgSubmittedWidth = g.w;
-      } catch (e) { return null; }
-      if (!bgImage || bgImage.length < 100) return null;
+      const natW = bg.tagName === 'CANVAS' ? bg.width : (bg.naturalWidth || Math.round(bgb.width));
+      const natH = bg.tagName === 'CANVAS' ? bg.height : (bg.naturalHeight || Math.round(bgb.height));
+      const g = await grab(bg, natW, natH, fitScale(natW, natH));
+      if (!g.b64 || g.b64.length < 100) {
+        return { error: 'bg-extract-failed', handleFound: how, bgTag: bg.tagName, bgSrc: String(bg.src || '').slice(0, 120) };
+      }
 
       // Optional small puzzle-piece image (second image for type 20111).
-      // Use the SAME scale as the background so Geepass can match them.
       let slideImage = '';
-      const allImgs = Array.from(document.querySelectorAll('img'));
-      for (const im of allImgs) {
+      const pieces = Array.from(document.querySelectorAll('img')).filter((im) => {
         const b = im.getBoundingClientRect();
-        if (b.width > 10 && b.width < 120 && b.height > 10 && b.height < 120 && im !== bg) {
-          try {
-            const g2 = grab(im, im.naturalWidth || b.width, im.naturalHeight || b.height, bgScale);
-            if (g2.b64.length > 100) { slideImage = g2.b64; break; }
-          } catch (e) { /* tainted; skip */ }
-        }
+        return im !== bg && b.width > 10 && b.width < 140 && b.height > 10 && b.height < 140 && vis(im);
+      });
+      for (const im of pieces) {
+        const b = im.getBoundingClientRect();
+        const g2 = await grab(im, im.naturalWidth || Math.round(b.width), im.naturalHeight || Math.round(b.height), 1);
+        if (g2.b64.length > 100) { slideImage = g2.b64; break; }
       }
 
       return {
@@ -133,9 +229,11 @@ export function puzzleProbeScript(): string {
         handleWidth: hb.width,
         trackWidth: tb.width,
         bgWidth: bgb.width,
-        bgNaturalWidth: bgSubmittedWidth,
+        bgNaturalWidth: g.w,
         bgOffsetX: bgb.x,
-        bgImage,
+        bgImage: g.b64,
+        bgVia: g.via,
+        handleFound: how,
         slideImage: slideImage || undefined,
       };
     })()
@@ -143,7 +241,10 @@ export function puzzleProbeScript(): string {
 }
 
 /** Locate the puzzle slider across all frames of the given webContents. */
-export async function locatePuzzle(wc: WebContents): Promise<PuzzleGeometry | null> {
+export async function locatePuzzle(
+  wc: WebContents,
+  diagnostics?: string[],
+): Promise<PuzzleGeometry | null> {
   if (wc.isDestroyed()) return null
   const visited = new Set<string>()
 
@@ -156,6 +257,11 @@ export async function locatePuzzle(wc: WebContents): Promise<PuzzleGeometry | nu
       const geo = await frame.executeJavaScript(puzzleProbeScript())
       if (geo && typeof geo.x === 'number' && geo.bgImage) {
         return { ...geo, x: geo.x + offsetX, y: geo.y + offsetY, bgOffsetX: geo.bgOffsetX + offsetX }
+      }
+      if (diagnostics && geo && geo.error) {
+        diagnostics.push(
+          `frame(${String(frame.url).slice(0, 60)}): ${geo.error}${geo.handleFound ? '/' + geo.handleFound : ''}${geo.bgVia ? '/' + geo.bgVia : ''}`,
+        )
       }
     } catch {
       // Frame may be gone; continue with children.
@@ -255,6 +361,50 @@ export async function dragHandle(
   })
 }
 
+/**
+ * Decode the pixel width from a base64 image header (PNG / JPEG / WebP).
+ * Used when the page handed over ORIGINAL bytes (canvas drawImage failed),
+ * so the main process can still compute the DOM<->pixel scale. Returns 0
+ * when the format is unrecognized.
+ */
+export function decodeImageWidth(b64: string): number {
+  try {
+    const buf = Buffer.from(b64.slice(0, 2048), 'base64')
+    // PNG: IHDR width at byte 16 (big endian)
+    if (buf.length > 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      return buf.readUInt32BE(16)
+    }
+    // JPEG: walk markers until SOF0-SOF15 (skip C4/C8/CC)
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+      let o = 2
+      while (o + 9 < buf.length) {
+        if (buf[o] !== 0xff) { o++; continue }
+        const marker = buf[o + 1]
+        if (marker === 0xff) { o++; continue }
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return buf.readUInt16BE(o + 7)
+        }
+        const len = buf.readUInt16BE(o + 2)
+        o += 2 + len
+      }
+      return 0
+    }
+    // WebP: VP8 (lossy) width at 26 (14 bits LE); VP8L at 21+ (14 bits)
+    if (buf.length > 30 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+      const fourcc = buf.toString('ascii', 12, 16)
+      if (fourcc === 'VP8 ') return buf.readUInt16LE(26) & 0x3fff
+      if (fourcc === 'VP8L') {
+        const b = buf.readUInt32LE(21)
+        return (b & 0x3fff) + 1
+      }
+      if (fourcc === 'VP8X') return (buf.readUInt8(24) | (buf.readUInt8(25) << 8) | (buf.readUInt8(26) << 16)) + 1
+    }
+    return 0
+  } catch {
+    return 0
+  }
+}
+
 export interface SolvePuzzleOptions {
   /** Progress messages (shown in the host UI / registration status). */
   onStatus?: (message: string) => void
@@ -271,11 +421,18 @@ export interface SolvePuzzleOptions {
  */
 export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions = {}): Promise<boolean> {
   if (!isGeepassEnabled() || wc.isDestroyed()) return false
-  const geo = await locatePuzzle(wc)
-  if (!geo || !geo.bgImage) return false
+  const diagnostics: string[] = []
+  const geo = await locatePuzzle(wc, diagnostics)
+  if (!geo || !geo.bgImage) {
+    if (diagnostics.length) console.log('[PuzzleSolver] probe:', diagnostics.join(' | '))
+    return false
+  }
 
   const onStatus = options.onStatus || (() => {})
   onStatus('检测到拼图验证，Geepass 正在识别缺口…')
+  console.log(
+    `[PuzzleSolver] puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth}`,
+  )
 
   let result
   try {
@@ -292,8 +449,11 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
   }
 
   // Scale the recognized gap X (submitted image pixels) to DOM pixels; the
-  // handle starts at the left edge, grip centered on the gap.
-  const scale = geo.bgNaturalWidth > 0 ? geo.bgWidth / geo.bgNaturalWidth : 1
+  // handle starts at the left edge, grip centered on the gap. When the page
+  // handed over ORIGINAL bytes (bgVia dataurl/fetch) the submitted width is
+  // 0, so decode the real pixel width from the image header instead.
+  const natural = geo.bgNaturalWidth > 0 ? geo.bgNaturalWidth : decodeImageWidth(geo.bgImage) || geo.bgWidth
+  const scale = natural > 0 ? geo.bgWidth / natural : 1
   const distance = result.x * scale - geo.handleWidth / 2
   if (!Number.isFinite(distance) || distance < 5) {
     console.warn('[PuzzleSolver] Implausible distance', distance, 'result', result)
@@ -330,7 +490,8 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
           slideImage: fresh.slideImage,
           type: fresh.slideImage ? 20111 : 20110,
         })
-        const scale2 = fresh.bgNaturalWidth > 0 ? fresh.bgWidth / fresh.bgNaturalWidth : 1
+        const nat2 = fresh.bgNaturalWidth > 0 ? fresh.bgNaturalWidth : decodeImageWidth(fresh.bgImage) || fresh.bgWidth
+        const scale2 = nat2 > 0 ? fresh.bgWidth / nat2 : 1
         const d2 = r2.x * scale2 - fresh.handleWidth / 2
         if (Number.isFinite(d2) && d2 >= 5) d = d2
       } catch (error) {
