@@ -19,6 +19,7 @@ import {
   getOrCreateTempAddress,
   waitForVerificationCode,
 } from './tempMail'
+import { solvePuzzle } from '../lib/puzzleSolver'
 
 export const QWEN_REGISTER_URL = 'https://chat.qwen.ai/auth?mode=register'
 const REGISTER_URL = QWEN_REGISTER_URL
@@ -56,6 +57,45 @@ async function waitForCondition(
     if (!wcAlive(wc)) return false
     const ok = await exec<boolean>(wc, `(function(){ try { return !!(${predicateJs}) } catch(e) { return false } })()`, 5000)
     if (ok) return true
+    await sleep(pollMs)
+  }
+  return false
+}
+
+/**
+ * Poll the page until the given JS predicate returns true, while watching for
+ * the inline puzzle captcha (“访问验证 / 拖动滑块完成拼图”) that Qwen may pop
+ * up during registration. When the puzzle appears and Geepass is enabled it
+ * is solved automatically; the wait continues until the condition holds or
+ * the timeout expires. solvePuzzle returns false fast when Geepass is off or
+ * no puzzle is present, so polling overhead stays small.
+ */
+async function waitForConditionWithPuzzle(
+  wc: WebContents,
+  predicateJs: string,
+  timeoutMs: number,
+  emitStatus: (message: string) => void,
+  pollMs = 600,
+): Promise<boolean> {
+  const checkJs = `(function(){ try { return !!(${predicateJs}) } catch(e) { return false } })()`
+  const deadline = Date.now() + timeoutMs
+  let lastPuzzleAttempt = 0
+  while (Date.now() < deadline) {
+    if (!wcAlive(wc)) return false
+    const ok = await exec<boolean>(wc, checkJs, 5000)
+    if (ok) return true
+
+    // Throttled puzzle attempt (solvePuzzle itself takes several seconds
+    // when a puzzle is present, so the throttle mainly avoids probe spam).
+    const now = Date.now()
+    if (now - lastPuzzleAttempt > 4000) {
+      lastPuzzleAttempt = now
+      const solved = await solvePuzzle(wc, {
+        onStatus: emitStatus,
+        verifySolved: async () => (await exec<boolean>(wc, checkJs, 5000)) === true,
+      })
+      if (solved) continue // re-check the condition immediately
+    }
     await sleep(pollMs)
   }
   return false
@@ -200,7 +240,14 @@ async function submitEmailForCode(
   emitStatus('正在提交邮箱，等待验证码邮件...')
   await exec<boolean>(wc, `(function(){ const b = ${CONTINUE_BUTTON_JS}; if (b) { b.click(); return true } return false })()`)
 
-  return waitForCondition(wc, `${DIGIT_INPUTS_JS}.length >= 6`, 30000)
+  // The inline puzzle captcha often guards this exact transition; allow
+  // extra time because Geepass recognition + drag adds several seconds.
+  return waitForConditionWithPuzzle(
+    wc,
+    `${DIGIT_INPUTS_JS}.length >= 6`,
+    60000,
+    emitStatus,
+  )
 }
 
 /**
@@ -280,6 +327,7 @@ export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ add
   emitStatus('注册成功，正在等待登录完成...')
   const deadline = Date.now() + 60000
   let accepted = false
+  let lastPuzzleAt = 0
   while (Date.now() < deadline) {
     if (!wcAlive(wc)) {
       accepted = true // window closed => login already completed
@@ -293,6 +341,15 @@ export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ add
     if (!onAuth) {
       accepted = true // navigated away from the auth page
       break
+    }
+    // A puzzle captcha may also guard the final submit; solve it inline.
+    if (Date.now() - lastPuzzleAt > 5000) {
+      lastPuzzleAt = Date.now()
+      await solvePuzzle(wc, {
+        onStatus: emitStatus,
+        verifySolved: async () =>
+          (await exec<boolean>(wc, `location.pathname.indexOf('/auth') < 0`)) === true,
+      })
     }
     await sleep(1000)
   }
