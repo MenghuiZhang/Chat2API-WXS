@@ -10,6 +10,7 @@
  * page has a specific success signal.
  */
 
+import { nativeImage } from 'electron'
 import type { WebContents, WebFrameMain } from 'electron'
 import { isGeepassEnabled, recognizeSlide } from './geepass'
 import type { GeepassResult } from './geepass'
@@ -242,7 +243,21 @@ export function puzzleProbeScript(): string {
         const c = document.createElement('canvas');
         c.width = Math.max(1, Math.round(natW * s));
         c.height = Math.max(1, Math.round(natH * s));
-        c.getContext('2d').drawImage(el, 0, 0, c.width, c.height);
+        const ctx = c.getContext('2d');
+        ctx.drawImage(el, 0, 0, c.width, c.height);
+        // Some Linux builds yield a BLANK (fully transparent) canvas instead
+        // of throwing on tainted draws; a blank PNG is billed-but-failed at
+        // the service. Sample pixels and bail out to the byte fallbacks.
+        try {
+          const d = ctx.getImageData(0, 0, c.width, c.height).data;
+          const seen = new Set();
+          const step = Math.max(1, Math.floor(d.length / 16384)) * 4;
+          for (let i = 0; i + 3 < d.length; i += step) {
+            seen.add((d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3]);
+            if (seen.size > 8) break;
+          }
+          if (seen.size < 3) return '';
+        } catch (e) { /* tainted: toDataURL below throws anyway */ }
         return c.toDataURL('image/png').split(',')[1] || '';
       };
       // Fallback when drawImage throws (tainted canvas) or yields nothing:
@@ -490,6 +505,62 @@ export function decodeImageWidth(b64: string): number {
   }
 }
 
+/**
+ * Re-encode a base64 image as a PNG fitted into Geepass' accepted pixel
+ * bounds [50, 1024]. The page-side fallbacks (data: URL / fetch) hand over
+ * ORIGINAL bytes that may be wider than 1024px or in a format the service
+ * rejects (WebP/AVIF), which shows up as billed-but-failed calls. Returns
+ * null when the buffer cannot be decoded by the main process.
+ */
+function normalizeForGeepass(b64: string): { b64: string; width: number; height: number } | null {
+  try {
+    let img = nativeImage.createFromBuffer(Buffer.from(b64, 'base64'))
+    if (img.isEmpty()) return null
+    let { width, height } = img.getSize()
+    if (width <= 0 || height <= 0) return null
+    let s = Math.min(1024 / width, 1024 / height, 1)
+    const sMin = Math.max(50 / width, 50 / height)
+    if (s < sMin) s = sMin
+    if (s !== 1) {
+      img = img.resize({
+        width: Math.max(1, Math.round(width * s)),
+        height: Math.max(1, Math.round(height * s)),
+      })
+      const sz = img.getSize()
+      width = sz.width
+      height = sz.height
+    }
+    const png = img.toPNG()
+    if (!png || png.length === 0) return null
+    return { b64: png.toString('base64'), width, height }
+  } catch {
+    return null
+  }
+}
+
+const PNG_B64_PREFIX = 'iVBORw0KGgo'
+
+/**
+ * Ensure the images about to be submitted are fitted PNGs. Canvas-path
+ * images already are; original-byte fallbacks are converted here. Mutates
+ * the geometry in place (bgNaturalWidth becomes the submitted pixel width).
+ */
+function ensureSubmissionNormalized(geo: PuzzleGeometry): void {
+  if (geo.bgNaturalWidth <= 0 || !geo.bgImage.startsWith(PNG_B64_PREFIX)) {
+    const norm = normalizeForGeepass(geo.bgImage)
+    if (norm) {
+      geo.bgImage = norm.b64
+      geo.bgNaturalWidth = norm.width
+    } else {
+      console.warn('[PuzzleSolver] bg not decodable in main process; submitting original bytes')
+    }
+  }
+  if (geo.slideImage && !geo.slideImage.startsWith(PNG_B64_PREFIX)) {
+    const norm = normalizeForGeepass(geo.slideImage)
+    if (norm) geo.slideImage = norm.b64
+  }
+}
+
 export interface SolvePuzzleOptions {
   /** Progress messages (shown in the host UI / registration status). */
   onStatus?: (message: string) => void
@@ -560,6 +631,10 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       return false
     }
 
+    // Original-byte fallbacks (Linux tainted canvas) must be re-encoded as
+    // fitted PNGs here, otherwise Geepass rejects the payload.
+    ensureSubmissionNormalized(geo)
+
     if (attempt === 1) {
       onStatus('检测到拼图验证，Geepass 正在识别缺口…')
       console.log(
@@ -578,6 +653,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
         const refreshed = await locatePuzzle(wc)
         if (!refreshed || !refreshed.bgImage) break
         Object.assign(geo, refreshed)
+        ensureSubmissionNormalized(geo)
       }
       try {
         // Plain single-image gap detection. Passing the piece sprite as a
