@@ -188,11 +188,11 @@ export function puzzleProbeScript(): string {
         }
         return true;
       });
-      pieceCands.sort((a, b2) => {
-        const ra = a.getBoundingClientRect();
-        const rb = b2.getBoundingClientRect();
-        return rb.width * rb.height - ra.width * ra.height;
-      });
+      // The movable piece starts at the LEFT edge while the gap silhouette
+      // sits wherever the puzzle placed it, so the leftmost sprite is the
+      // piece (smallest-area picking could grab the gap overlay instead and
+      // collapse the drag distance to ~0).
+      pieceCands.sort((a, b2) => a.getBoundingClientRect().x - b2.getBoundingClientRect().x);
       const piece = pieceCands[0] || null;
       const pieceRect = piece ? piece.getBoundingClientRect() : null;
 
@@ -580,16 +580,29 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
         Object.assign(geo, refreshed)
       }
       try {
-        // Single-image gap detection; the piece sprite is passed as `slide`
-        // so the recognizer locks onto the gap silhouette, not the piece.
+        // Plain single-image gap detection. Passing the piece sprite as a
+        // 'slide' disambiguation image backfired (the service either errors
+        // or reports the piece's own position), so keep the call minimal.
         result = await recognizeSlide({
           bgImage: geo.bgImage,
-          slideImage: geo.slideImage,
           type: 20110,
         })
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error)
         console.warn('[PuzzleSolver] Geepass recognition failed:', lastError)
+      }
+    }
+    // Last resort: two-image mode (bg with gap + separate piece sprite).
+    if (!result && geo.slideImage) {
+      try {
+        result = await recognizeSlide({
+          bgImage: geo.bgImage,
+          slideImage: geo.slideImage,
+          type: 20111,
+        })
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        console.warn('[PuzzleSolver] Geepass 20111 fallback failed:', lastError)
       }
     }
     if (!result) {
@@ -609,13 +622,21 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // start, so using its live position keeps the delta exact. When the
     // piece element is not detected, fall back to the old assumption that
     // the piece starts at the left edge of the track.
+    // Sanity: the piece must sit LEFT of the recognized gap; otherwise the
+    // detected 'piece' was really the gap overlay and we fall back to the
+    // track-start assumption.
     const pieceStart =
-      typeof geo.pieceCenterX === 'number' ? geo.pieceCenterX : geo.bgOffsetX + geo.handleWidth / 2
+      typeof geo.pieceCenterX === 'number' && geo.pieceCenterX < gapCenterDom - 5
+        ? geo.pieceCenterX
+        : geo.bgOffsetX + geo.handleWidth / 2
     const distance = gapCenterDom - pieceStart
     if (!Number.isFinite(distance) || distance < 5) {
+      // Gap recognized at/behind the track start: nothing sensible to drag.
+      // Refresh for a new puzzle and retry instead of giving up silently.
       console.warn('[PuzzleSolver] Implausible distance', distance, 'result', result)
-      onStatus('Geepass 识别结果异常，请手动拖动滑块')
-      return false
+      onStatus('Geepass 识别结果异常，换图重试…')
+      await clickPuzzleRefresh(wc, geo)
+      continue
     }
     console.log(
       `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} attempt=${attempt}`,
@@ -684,14 +705,21 @@ export function startPuzzleWatcher(
 
   let stopped = false
   let busy = false
+  let lastDisabledAt = 0
   const timer = setInterval(() => {
     if (stopped || busy || wc.isDestroyed()) return
     busy = true
     void (async () => {
       try {
-        if (!isGeepassEnabled()) return
         const geo = await locatePuzzle(wc)
         if (!geo) return
+        if (!isGeepassEnabled()) {
+          if (Date.now() - lastDisabledAt > 30000) {
+            lastDisabledAt = Date.now()
+            if (onStatus) onStatus('检测到拼图验证，但 Geepass 未启用，请手动拖动滑块')
+          }
+          return
+        }
         await solvePuzzle(wc, { onStatus })
       } catch (error) {
         console.warn('[PuzzleSolver] watcher error:', error)
