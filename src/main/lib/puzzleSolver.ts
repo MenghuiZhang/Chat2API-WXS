@@ -12,8 +12,12 @@
 
 import type { WebContents, WebFrameMain } from 'electron'
 import { isGeepassEnabled, recognizeSlide } from './geepass'
+import type { GeepassResult } from './geepass'
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** In-flight solve attempts per webContents (concurrent callers dedupe). */
+const activeSolves = new Map<WebContents, Promise<boolean>>()
 
 export interface PuzzleGeometry {
   /** Drag handle center in main-frame viewport coordinates */
@@ -36,6 +40,13 @@ export interface PuzzleGeometry {
   handleFound?: string
   /** How the background bytes were obtained (canvas/dataurl/fetch) */
   bgVia?: string
+  /** Current center X of the movable puzzle piece (main-frame coords) */
+  pieceCenterX?: number
+  /** Center of the puzzle refresh button (main-frame coords), if found */
+  refreshX?: number
+  refreshY?: number
+  /** A failure banner ("验证失败，请重试") is currently shown */
+  failed?: boolean
 }
 
 /**
@@ -156,6 +167,66 @@ export function puzzleProbeScript(): string {
         handle.parentElement;
       const tb = track ? track.getBoundingClientRect() : bgb;
 
+      // --- Movable puzzle piece (separate element riding on the bg) --------
+      // Used both as the 'slide' disambiguation image (so the recognizer
+      // locks onto the gap silhouette instead of the piece itself) and, via
+      // its CURRENT center, to compute the exact drag delta — after a failed
+      // attempt the piece does not snap back to the track start.
+      const pieceBandTop = bgb.top + bgb.height * 0.15;
+      const pieceBandBottom = bgb.bottom - bgb.height * 0.15;
+      const pieceCands = Array.from(document.querySelectorAll('img, canvas, div, span')).filter((el) => {
+        if (el === bg) return false;
+        const b = el.getBoundingClientRect();
+        if (b.width < 10 || b.width > 140 || b.height < 10 || b.height > 140) return false;
+        if (!vis(el)) return false;
+        const cy = b.top + b.height / 2;
+        if (cy < pieceBandTop || cy > pieceBandBottom) return false;
+        if (b.right < bgb.left - 30 || b.left > bgb.right + 30) return false;
+        if (el.tagName !== 'IMG' && el.tagName !== 'CANVAS') {
+          const bi = getComputedStyle(el).backgroundImage || '';
+          if (!/url\(/.test(bi)) return false;
+        }
+        return true;
+      });
+      pieceCands.sort((a, b2) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b2.getBoundingClientRect();
+        return rb.width * rb.height - ra.width * ra.height;
+      });
+      const piece = pieceCands[0] || null;
+      const pieceRect = piece ? piece.getBoundingClientRect() : null;
+
+      // --- Refresh button (small square at the bg top-right corner) --------
+      let refreshRect = null;
+      const refreshCands = Array.from(document.querySelectorAll('img, canvas, div, span, button, i, svg, a')).filter((el) => {
+        const b = el.getBoundingClientRect();
+        if (b.width < 12 || b.width > 60 || b.height < 12 || b.height > 60) return false;
+        if (!vis(el)) return false;
+        return b.right > bgb.right - 50 && b.left < bgb.right + 25 && b.top < bgb.top + 50 && b.bottom > bgb.top - 15;
+      });
+      refreshCands.sort((a, b2) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b2.getBoundingClientRect();
+        const da = Math.hypot(bgb.right - ra.right, ra.top - bgb.top);
+        const db = Math.hypot(bgb.right - rb.right, rb.top - bgb.top);
+        return da - db;
+      });
+      if (refreshCands[0]) refreshRect = refreshCands[0].getBoundingClientRect();
+
+      // --- Failure banner ("验证失败，请重试") below the bg -----------------
+      let failed = false;
+      if (document.body) {
+        const fw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let fn;
+        while ((fn = fw.nextNode())) {
+          const ft = (fn.nodeValue || '').trim();
+          if (!ft || ft.length > 30) continue;
+          if (!/验证失败|请重试|失败.*重试|retry/i.test(ft)) continue;
+          const fr = fn.parentElement ? fn.parentElement.getBoundingClientRect() : null;
+          if (fr && Math.abs(fr.top - bgb.bottom) < 300) { failed = true; break; }
+        }
+      }
+
       // --- Image extraction with fallbacks ---------------------------------
       // Geepass requires width/height within [50, 1024]; downscale (or
       // upscale tiny pieces) to fit and report the SUBMITTED width so the
@@ -181,8 +252,12 @@ export function puzzleProbeScript(): string {
         let b64 = '';
         try { b64 = draw(el, natW, natH, s); } catch (e) { b64 = ''; }
         if (b64 && b64.length > 100) return { b64, w: Math.max(1, Math.round(natW * s)), via: 'canvas' };
-        if (el.tagName === 'IMG') {
-          const src = el.currentSrc || el.src || '';
+        {
+          // IMG src or, for div/span pieces, the CSS background-image url.
+          const src =
+            el.tagName === 'IMG'
+              ? (el.currentSrc || el.src || '')
+              : ((/url\(["']?(.*?)["']?\)/.exec(getComputedStyle(el).backgroundImage || '') || [])[1] || '');
           if (src.startsWith('data:')) {
             const i = src.indexOf(',');
             if (i > 0) return { b64: src.slice(i + 1), w: 0, via: 'dataurl' };
@@ -211,16 +286,14 @@ export function puzzleProbeScript(): string {
         return { error: 'bg-extract-failed', handleFound: how, bgTag: bg.tagName, bgSrc: String(bg.src || '').slice(0, 120) };
       }
 
-      // Optional small puzzle-piece image (second image for type 20111).
+      // The movable piece sprite doubles as the 'slide' disambiguation image
+      // so the recognizer locks onto the gap silhouette instead of the piece.
       let slideImage = '';
-      const pieces = Array.from(document.querySelectorAll('img')).filter((im) => {
-        const b = im.getBoundingClientRect();
-        return im !== bg && b.width > 10 && b.width < 140 && b.height > 10 && b.height < 140 && vis(im);
-      });
-      for (const im of pieces) {
-        const b = im.getBoundingClientRect();
-        const g2 = await grab(im, im.naturalWidth || Math.round(b.width), im.naturalHeight || Math.round(b.height), 1);
-        if (g2.b64.length > 100) { slideImage = g2.b64; break; }
+      if (piece) {
+        const pw = piece.tagName === 'CANVAS' ? piece.width : (piece.naturalWidth || Math.round(pieceRect.width));
+        const ph = piece.tagName === 'CANVAS' ? piece.height : (piece.naturalHeight || Math.round(pieceRect.height));
+        const g2 = await grab(piece, pw, ph, 1);
+        if (g2.b64.length > 100) slideImage = g2.b64;
       }
 
       return {
@@ -235,6 +308,10 @@ export function puzzleProbeScript(): string {
         bgVia: g.via,
         handleFound: how,
         slideImage: slideImage || undefined,
+        pieceCenterX: pieceRect ? pieceRect.x + pieceRect.width / 2 : undefined,
+        refreshX: refreshRect ? refreshRect.x + refreshRect.width / 2 : undefined,
+        refreshY: refreshRect ? refreshRect.y + refreshRect.height / 2 : undefined,
+        failed: failed || undefined,
       };
     })()
   `
@@ -256,7 +333,15 @@ export async function locatePuzzle(
     try {
       const geo = await frame.executeJavaScript(puzzleProbeScript())
       if (geo && typeof geo.x === 'number' && geo.bgImage) {
-        return { ...geo, x: geo.x + offsetX, y: geo.y + offsetY, bgOffsetX: geo.bgOffsetX + offsetX }
+        return {
+          ...geo,
+          x: geo.x + offsetX,
+          y: geo.y + offsetY,
+          bgOffsetX: geo.bgOffsetX + offsetX,
+          pieceCenterX: typeof geo.pieceCenterX === 'number' ? geo.pieceCenterX + offsetX : undefined,
+          refreshX: typeof geo.refreshX === 'number' ? geo.refreshX + offsetX : undefined,
+          refreshY: typeof geo.refreshY === 'number' ? geo.refreshY + offsetY : undefined,
+        }
       }
       if (diagnostics && geo && geo.error) {
         diagnostics.push(
@@ -410,7 +495,7 @@ export interface SolvePuzzleOptions {
   onStatus?: (message: string) => void
   /** Custom "solved?" check run after each drag (host-page specific). */
   verifySolved?: () => Promise<boolean>
-  /** Drag attempts before giving up (default 2). */
+  /** Drag attempts before giving up (default 3; each retry refreshes the puzzle). */
   maxAttempts?: number
 }
 
@@ -421,47 +506,25 @@ export interface SolvePuzzleOptions {
  */
 export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions = {}): Promise<boolean> {
   if (!isGeepassEnabled() || wc.isDestroyed()) return false
-  const diagnostics: string[] = []
-  const geo = await locatePuzzle(wc, diagnostics)
-  if (!geo || !geo.bgImage) {
-    if (diagnostics.length) console.log('[PuzzleSolver] probe:', diagnostics.join(' | '))
-    return false
-  }
 
-  const onStatus = options.onStatus || (() => {})
-  onStatus('检测到拼图验证，Geepass 正在识别缺口…')
-  console.log(
-    `[PuzzleSolver] puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth}`,
-  )
+  // Dedupe concurrent solve attempts on the same webContents: the global
+  // watcher and the per-step wait loops may notice the captcha at the same
+  // time; the second caller simply awaits the in-flight attempt.
+  const pending = activeSolves.get(wc)
+  if (pending) return pending
 
-  let result
+  const run = solvePuzzleInner(wc, options)
+  activeSolves.set(wc, run)
   try {
-    result = await recognizeSlide({
-      bgImage: geo.bgImage,
-      slideImage: geo.slideImage,
-      type: geo.slideImage ? 20111 : 20110,
-    })
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error)
-    console.warn('[PuzzleSolver] Geepass recognition failed:', msg)
-    onStatus(`Geepass 识别失败: ${msg}`)
-    return false
+    return await run
+  } finally {
+    if (activeSolves.get(wc) === run) activeSolves.delete(wc)
   }
+}
 
-  // Scale the recognized gap X (submitted image pixels) to DOM pixels; the
-  // handle starts at the left edge, grip centered on the gap. When the page
-  // handed over ORIGINAL bytes (bgVia dataurl/fetch) the submitted width is
-  // 0, so decode the real pixel width from the image header instead.
-  const natural = geo.bgNaturalWidth > 0 ? geo.bgNaturalWidth : decodeImageWidth(geo.bgImage) || geo.bgWidth
-  const scale = natural > 0 ? geo.bgWidth / natural : 1
-  const distance = result.x * scale - geo.handleWidth / 2
-  if (!Number.isFinite(distance) || distance < 5) {
-    console.warn('[PuzzleSolver] Implausible distance', distance, 'result', result)
-    onStatus('Geepass 识别结果异常，请手动拖动滑块')
-    return false
-  }
-  console.log(`[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} distance=${distance.toFixed(1)}`)
-  onStatus('Geepass 识别成功，正在拖动滑块…')
+async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): Promise<boolean> {
+  const onStatus = options.onStatus || (() => {})
+  const maxAttempts = options.maxAttempts ?? 3
 
   const defaultVerify = async (): Promise<boolean> => {
     await sleep(1800 + Math.random() * 700)
@@ -476,37 +539,175 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
     }
   }
   const verify = options.verifySolved || defaultVerify
-  const maxAttempts = options.maxAttempts ?? 2
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (wc.isDestroyed()) return false
-    const fresh = (await locatePuzzle(wc)) || geo
-    // Gap may have refreshed after a failed attempt; re-recognize.
-    let d = distance
-    if (attempt > 1 && fresh.bgImage && fresh.bgImage !== geo.bgImage) {
+
+    // Locate (or re-locate after a failed attempt) the puzzle.
+    const diagnostics: string[] = []
+    const geo = await locatePuzzle(wc, diagnostics)
+    if (!geo || !geo.bgImage) {
+      if (attempt === 1) {
+        if (diagnostics.length) console.log('[PuzzleSolver] probe:', diagnostics.join(' | '))
+        return false
+      }
+      // Puzzle vanished mid-attempt — the previous drag most likely solved it.
+      if (await verify()) {
+        console.log('[PuzzleSolver] Puzzle solved')
+        onStatus('拼图验证通过')
+        return true
+      }
+      return false
+    }
+
+    if (attempt === 1) {
+      onStatus('检测到拼图验证，Geepass 正在识别缺口…')
+      console.log(
+        `[PuzzleSolver] puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`,
+      )
+    } else {
+      onStatus(`验证未通过，Geepass 重新识别中（第 ${attempt}/${maxAttempts} 次）…`)
+    }
+
+    // Recognize the gap; on API failure refresh the puzzle and retry once.
+    let result: GeepassResult | null = null
+    let lastError = ''
+    for (let rec = 0; rec < 2 && !result; rec++) {
+      if (rec > 0) {
+        await clickPuzzleRefresh(wc, geo)
+        const refreshed = await locatePuzzle(wc)
+        if (!refreshed || !refreshed.bgImage) break
+        Object.assign(geo, refreshed)
+      }
       try {
-        const r2 = await recognizeSlide({
-          bgImage: fresh.bgImage,
-          slideImage: fresh.slideImage,
-          type: fresh.slideImage ? 20111 : 20110,
+        // Single-image gap detection; the piece sprite is passed as `slide`
+        // so the recognizer locks onto the gap silhouette, not the piece.
+        result = await recognizeSlide({
+          bgImage: geo.bgImage,
+          slideImage: geo.slideImage,
+          type: 20110,
         })
-        const nat2 = fresh.bgNaturalWidth > 0 ? fresh.bgNaturalWidth : decodeImageWidth(fresh.bgImage) || fresh.bgWidth
-        const scale2 = nat2 > 0 ? fresh.bgWidth / nat2 : 1
-        const d2 = r2.x * scale2 - fresh.handleWidth / 2
-        if (Number.isFinite(d2) && d2 >= 5) d = d2
       } catch (error) {
-        console.warn('[PuzzleSolver] Retry recognition failed:', error)
+        lastError = error instanceof Error ? error.message : String(error)
+        console.warn('[PuzzleSolver] Geepass recognition failed:', lastError)
       }
     }
+    if (!result) {
+      onStatus(`Geepass 识别失败: ${lastError}`)
+      return false
+    }
+
+    // Scale the recognized gap X (submitted image pixels) to DOM pixels.
+    // When the page handed over ORIGINAL bytes (bgVia dataurl/fetch) the
+    // submitted width is 0, so decode the real pixel width from the header.
+    const natural = geo.bgNaturalWidth > 0 ? geo.bgNaturalWidth : decodeImageWidth(geo.bgImage) || geo.bgWidth
+    const scale = natural > 0 ? geo.bgWidth / natural : 1
+    const gapCenterDom = result.x * scale
+
+    // The drag delta moves the piece's CURRENT center onto the gap center.
+    // After a failed attempt the piece does not snap back to the track
+    // start, so using its live position keeps the delta exact. When the
+    // piece element is not detected, fall back to the old assumption that
+    // the piece starts at the left edge of the track.
+    const pieceStart =
+      typeof geo.pieceCenterX === 'number' ? geo.pieceCenterX : geo.bgOffsetX + geo.handleWidth / 2
+    const distance = gapCenterDom - pieceStart
+    if (!Number.isFinite(distance) || distance < 5) {
+      console.warn('[PuzzleSolver] Implausible distance', distance, 'result', result)
+      onStatus('Geepass 识别结果异常，请手动拖动滑块')
+      return false
+    }
+    console.log(
+      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} attempt=${attempt}`,
+    )
+    onStatus('Geepass 识别成功，正在拖动滑块…')
+
     await sleep(300 + Math.random() * 400)
-    await dragHandle(wc, fresh, d)
+    await dragHandle(wc, geo, distance)
     if (await verify()) {
       console.log('[PuzzleSolver] Puzzle solved')
       onStatus('拼图验证通过')
       return true
     }
+
+    // Failed: the captcha now shows a failure banner. Click refresh to get
+    // a brand-new puzzle image before the next attempt.
+    console.log(`[PuzzleSolver] attempt ${attempt}/${maxAttempts} failed, refreshing puzzle`)
+    await clickPuzzleRefresh(wc, geo)
   }
 
   onStatus('Geepass 自动验证未通过，请手动拖动滑块')
   return false
+}
+
+/** Click the puzzle refresh button (small icon at the bg top-right corner). */
+async function clickPuzzleRefresh(wc: WebContents, geo: PuzzleGeometry): Promise<void> {
+  if (wc.isDestroyed()) return
+  if (typeof geo.refreshX === 'number' && typeof geo.refreshY === 'number') {
+    const x = Math.round(geo.refreshX)
+    const y = Math.round(geo.refreshY)
+    wc.sendInputEvent({ type: 'mouseMove', x, y, clickCount: 0 })
+    await sleep(60 + Math.random() * 80)
+    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+    wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+  } else {
+    // No refresh button found — click the background itself; several Aliyun
+    // punish variants reload the puzzle on a background click.
+    const x = Math.round(geo.bgOffsetX + geo.bgWidth / 2)
+    const y = Math.round(geo.y - geo.handleWidth * 2)
+    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+    wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+  }
+  await sleep(900 + Math.random() * 600)
+}
+
+// ==================== Global puzzle watcher ====================
+
+const watchers = new Map<WebContents, { stop: () => void }>()
+
+/**
+ * Watch a webContents for the puzzle captcha across the WHOLE page lifetime
+ * (not only inside specific wait loops) and solve it automatically while it
+ * is visible. The registration page can pop the captcha up at any moment
+ * (initial form, after submitting the address, after the code), so a global
+ * watcher closes the gaps left by per-step polling. Returns a stop function;
+ * starting twice for the same webContents reuses the existing watcher.
+ */
+export function startPuzzleWatcher(
+  wc: WebContents,
+  onStatus?: (message: string) => void,
+  intervalMs = 2500,
+): () => void {
+  if (wc.isDestroyed()) return () => {}
+  const existing = watchers.get(wc)
+  if (existing) return existing.stop
+
+  let stopped = false
+  let busy = false
+  const timer = setInterval(() => {
+    if (stopped || busy || wc.isDestroyed()) return
+    busy = true
+    void (async () => {
+      try {
+        if (!isGeepassEnabled()) return
+        const geo = await locatePuzzle(wc)
+        if (!geo) return
+        await solvePuzzle(wc, { onStatus })
+      } catch (error) {
+        console.warn('[PuzzleSolver] watcher error:', error)
+      } finally {
+        busy = false
+      }
+    })()
+  }, intervalMs)
+
+  const stop = (): void => {
+    stopped = true
+    clearInterval(timer)
+    watchers.delete(wc)
+    if (!wc.isDestroyed()) wc.removeListener('destroyed', stop)
+  }
+  wc.once('destroyed', stop)
+  watchers.set(wc, { stop })
+  return stop
 }
