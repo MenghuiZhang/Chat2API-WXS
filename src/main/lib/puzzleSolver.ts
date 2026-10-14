@@ -14,6 +14,11 @@ import { nativeImage } from 'electron'
 import type { WebContents, WebFrameMain } from 'electron'
 import { isGeepassEnabled, recognizeSlide } from './geepass'
 import type { GeepassResult } from './geepass'
+import { storeManager } from '../store/store'
+
+function logPuzzle(level: 'info' | 'warn' | 'error', message: string, extra?: Record<string, unknown>): void {
+  try { storeManager.addLog(level, `[PuzzleSolver] ${message}`, extra) } catch { /* store not ready */ }
+}
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -514,7 +519,16 @@ export function decodeImageWidth(b64: string): number {
  */
 function normalizeForGeepass(b64: string): { b64: string; width: number; height: number } | null {
   try {
+    // Try the strict byte decoder first; on failure (e.g. unusual PNG chunks
+    // from captcha CDNs on some Linux builds) fall back to the more lenient
+    // DataURL path which goes through Chromium's image pipeline.
     let img = nativeImage.createFromBuffer(Buffer.from(b64, 'base64'))
+    if (img.isEmpty()) {
+      img = nativeImage.createFromDataURL(`data:image/png;base64,${b64}`)
+    }
+    if (img.isEmpty()) {
+      img = nativeImage.createFromDataURL(`data:image/jpeg;base64,${b64}`)
+    }
     if (img.isEmpty()) return null
     let { width, height } = img.getSize()
     if (width <= 0 || height <= 0) return null
@@ -533,7 +547,8 @@ function normalizeForGeepass(b64: string): { b64: string; width: number; height:
     const png = img.toPNG()
     if (!png || png.length === 0) return null
     return { b64: png.toString('base64'), width, height }
-  } catch {
+  } catch (e) {
+    logPuzzle('warn', `normalize error: ${e instanceof Error ? e.message : String(e)}`)
     return null
   }
 }
@@ -547,12 +562,14 @@ const PNG_B64_PREFIX = 'iVBORw0KGgo'
  */
 function ensureSubmissionNormalized(geo: PuzzleGeometry): void {
   if (geo.bgNaturalWidth <= 0 || !geo.bgImage.startsWith(PNG_B64_PREFIX)) {
+    const before = geo.bgImage.length
     const norm = normalizeForGeepass(geo.bgImage)
     if (norm) {
       geo.bgImage = norm.b64
       geo.bgNaturalWidth = norm.width
+      logPuzzle('info', `bg normalized -> ${norm.width}px (srcLen=${before})`)
     } else {
-      console.warn('[PuzzleSolver] bg not decodable in main process; submitting original bytes')
+      logPuzzle('warn', `bg normalize failed (srcLen=${before}); submitting original bytes`)
     }
   }
   if (geo.slideImage && !geo.slideImage.startsWith(PNG_B64_PREFIX)) {
@@ -637,6 +654,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
 
     if (attempt === 1) {
       onStatus('检测到拼图验证，Geepass 正在识别缺口…')
+      logPuzzle('info', `puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`)
       console.log(
         `[PuzzleSolver] puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`,
       )
@@ -659,12 +677,15 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
         // Plain single-image gap detection. Passing the piece sprite as a
         // 'slide' disambiguation image backfired (the service either errors
         // or reports the piece's own position), so keep the call minimal.
+        logPuzzle('info', `geepass call type=20110 b64len=${geo.bgImage.length} submittedW=${geo.bgNaturalWidth}`)
         result = await recognizeSlide({
           bgImage: geo.bgImage,
           type: 20110,
         })
+        logPuzzle('info', `geepass ok x=${result.x} y=${result.y}`)
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error)
+        logPuzzle('error', `geepass call failed: ${lastError}`)
         console.warn('[PuzzleSolver] Geepass recognition failed:', lastError)
       }
     }

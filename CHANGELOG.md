@@ -2,6 +2,13 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
+## [1.7.7] - 2026-10-14
+
+### 🐛 修复 (Bug Fixes)
+
+- 修复 Linux 上拼图「干脆调不到 Geepass（后台无调用记录）」问题：v1.7.6 的 `nativeImage.createFromBuffer` 归一化在部分拼图 PNG（带非标准块/透明帧）上返回 empty，走 nativeImage DataURL 容错路径（Chromium 图像管线）提升解码成功率；归一化失败不再静默，改为写入应用日志便于定位
+- 拼图全流程接入应用日志（应用「日志」页可见）：puzzle found（探到拼图并附 via/bgVia/bgW/submitted/handle/track/piece/refresh）、geepass call 起飞前（20110、b64len、submittedW）、geepass ok/failed（错误原文）、归一化结果——排查「到底卡在哪一步」不再依赖主进程控制台
+
 ## [1.7.6] - 2026-10-14
 
 ### 🐛 修复 (Bug Fixes)
