@@ -49,6 +49,16 @@ function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, label: string):
 /** In-flight solve attempts per webContents (concurrent callers dedupe). */
 const activeSolves = new Map<WebContents, Promise<boolean>>()
 
+/**
+ * Generation counter per webContents. When the solve watchdog gives up on a
+ * stuck attempt it bumps the generation; the abandoned (orphaned) inner loop
+ * notices on its next checkpoint and exits WITHOUT dragging, refreshing or
+ * emitting status. Without this the orphan keeps dragging the handle while a
+ * FRESH attempt drags it too — interleaved strokes that can never verify,
+ * which reads from the outside as "stuck on the new captcha forever".
+ */
+const solveGenerations = new Map<WebContents, number>()
+
 export interface PuzzleGeometry {
   /** Drag handle center in main-frame viewport coordinates */
   x: number
@@ -458,7 +468,12 @@ export async function locatePuzzle(
 export function humanTrajectory(distance: number): Array<{ dx: number; dy: number }> {
   const points: Array<{ dx: number; dy: number }> = []
   const steps = 45 + Math.floor(Math.random() * 30)
-  const overshoot = Math.min(12, 3 + Math.random() * 5 + distance * 0.015)
+  // Sign-aware: closed-loop correction drags can be NEGATIVE (pull the piece
+  // back after an overshoot). The overshoot must point along the drag
+  // direction, otherwise a pull-back stroke would surge forward first and
+  // zig-zag across the gap.
+  const dir = distance < 0 ? -1 : 1
+  const overshoot = dir * Math.min(12, 3 + Math.random() * 5 + Math.abs(distance) * 0.015)
   let yDrift = 0
 
   for (let i = 1; i <= steps; i++) {
@@ -489,12 +504,16 @@ export async function dragHandle(
   geo: { x: number; y: number; handleWidth: number; trackWidth: number },
   distanceOverride?: number,
 ): Promise<void> {
-  const distance = Math.max(
-    20,
+  // NOTE: no Math.max(20, …) clamp here. The closed-loop correction drags by
+  // the measured residual, which can be NEGATIVE (piece overshot the gap and
+  // must be pulled back); clamping to +20 would turn every pull-back nudge
+  // into a +20 push and make the residual oscillate instead of converging.
+  // Only guard against degenerate zero-length drags on the full-stroke path.
+  const raw =
     distanceOverride != null
       ? Math.round(distanceOverride)
-      : geo.trackWidth - geo.handleWidth - 1,
-  )
+      : geo.trackWidth - geo.handleWidth - 1
+  const distance = raw === 0 ? (distanceOverride != null ? 0 : 20) : raw
   const startX = Math.round(geo.x)
   const startY = Math.round(geo.y)
 
@@ -808,13 +827,19 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
   const pending = activeSolves.get(wc)
   if (pending) return pending
 
-  const run = solvePuzzleInner(wc, options)
+  const generation = (solveGenerations.get(wc) ?? 0) + 1
+  solveGenerations.set(wc, generation)
+  const run = solvePuzzleInner(wc, options, generation)
   activeSolves.set(wc, run)
   // Hard watchdog: even with per-probe deadlines a pathological sequence can
   // overrun; when it does, release the dedupe entry so the next watcher tick
   // starts a FRESH attempt instead of awaiting the stuck promise forever.
+  // Bumping the generation also silences the orphaned inner loop so it stops
+  // dragging/refreshing under the fresh attempt's feet.
   const watchdog = new Promise<boolean>((resolve) => {
     setTimeout(() => {
+      if ((solveGenerations.get(wc) ?? 0) > generation) return
+      solveGenerations.set(wc, generation + 1)
       logPuzzle('warn', 'solve watchdog fired; releasing dedupe entry for a fresh attempt')
       console.warn('[PuzzleSolver] solve watchdog fired; releasing dedupe entry')
       resolve(false)
@@ -827,9 +852,16 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
   }
 }
 
-async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): Promise<boolean> {
+async function solvePuzzleInner(
+  wc: WebContents,
+  options: SolvePuzzleOptions,
+  generation: number,
+): Promise<boolean> {
   const onStatus = options.onStatus || (() => {})
   const maxAttempts = options.maxAttempts ?? 3
+  // Orphan guard: the watchdog (or a newer solve) bumped the generation while
+  // this loop was awaiting — stop silently so two loops never drag at once.
+  const stale = (): boolean => (solveGenerations.get(wc) ?? generation) !== generation
 
   const defaultVerify = async (): Promise<boolean> => {
     await sleep(1800 + Math.random() * 700)
@@ -851,7 +883,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
   const verify = options.verifySolved || defaultVerify
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (wc.isDestroyed()) return false
+    if (wc.isDestroyed() || stale()) return false
 
     // Locate (or re-locate after a failed attempt) the puzzle.
     const diagnostics: string[] = []
@@ -940,7 +972,12 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       }
     }
     if (!result) {
-      onStatus(`Geepass 识别失败: ${lastError}`)
+      // Do NOT leave the rejected image + failure banner on screen: the next
+      // watcher tick would re-probe the same dead image and the UI reads as
+      // "stuck on the new captcha". Swap in a fresh puzzle and report clearly.
+      onStatus(`Geepass 识别失败: ${lastError}，已换图等待下次自动识别`)
+      logPuzzle('error', `recognition failed: ${lastError}; refreshing for the next tick`)
+      await clickPuzzleRefresh(wc, geo)
       return false
     }
 
@@ -963,6 +1000,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     )
     onStatus('Geepass 识别成功，正在拖动滑块…')
 
+    if (stale()) return false
     await sleep(300 + Math.random() * 400)
     await dragHandle(wc, geo, handleDistance)
 
@@ -971,9 +1009,10 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // image scale, stroke ratio, frame offsets) can be slightly off; the
     // rendered piece is the ground truth. correctionDelta skips negligible
     // residuals and implausibly large ones (drag rejected / piece reset).
+    if (stale()) return false
     await sleep(500 + Math.random() * 300)
     const landed = await locatePuzzle(wc)
-    if (landed && typeof landed.pieceCenterX === 'number') {
+    if (!stale() && landed && typeof landed.pieceCenterX === 'number') {
       const residual = correctionDelta(gapCenterDom, landed.pieceCenterX, distance)
       if (residual !== 0) {
         console.log(
@@ -995,6 +1034,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // Failed: the captcha now shows a failure banner. Click refresh to get
     // a brand-new puzzle image before the next attempt.
     console.log(`[PuzzleSolver] attempt ${attempt}/${maxAttempts} failed, refreshing puzzle`)
+    if (stale()) return false
     await clickPuzzleRefresh(wc, geo)
   }
 

@@ -126,6 +126,24 @@ test('humanTrajectory: ends exactly at target distance, midpoints overshoot', ()
   }
 })
 
+test('humanTrajectory: negative distance (pull-back nudge) overshoots backwards', () => {
+  const code = extractFunction('humanTrajectory')
+  const fn = new Function(`${code}; return humanTrajectory;`)()
+
+  for (const target of [-12, -40]) {
+    const pts = fn(target)
+    const last = pts[pts.length - 1]
+    assert.equal(last.dx, target, 'final point equals negative target')
+    assert.equal(last.dy, 0)
+    // Overshoot must go PAST the target in the negative direction, never
+    // surge positive first (that zig-zag is what broke closed-loop nudges).
+    const minDx = Math.min(...pts.map((p) => p.dx))
+    assert.ok(minDx < target, `trajectory for ${target} undershoots (min=${minDx})`)
+    const maxDx = Math.max(...pts.map((p) => p.dx))
+    assert.ok(maxDx <= 1, `no positive surge for ${target} (max=${maxDx})`)
+  }
+})
+
 // --- planDrag --------------------------------------------------------------
 // planDrag delegates header decoding to decodeImageWidth; inject both.
 function extractPlanDrag() {
