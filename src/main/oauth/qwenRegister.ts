@@ -241,11 +241,14 @@ async function submitEmailForCode(
   await exec<boolean>(wc, `(function(){ const b = ${CONTINUE_BUTTON_JS}; if (b) { b.click(); return true } return false })()`)
 
   // The inline puzzle captcha often guards this exact transition; allow
-  // extra time because Geepass recognition + drag adds several seconds.
+  // extra time because Geepass recognition + drag adds several seconds, and
+  // a failed attempt refreshes the puzzle for a brand-new image — the whole
+  // wait must survive several solve/refresh cycles instead of throwing while
+  // the solver is still making progress ("换图后不接着认证" complaint).
   return waitForConditionWithPuzzle(
     wc,
     `${DIGIT_INPUTS_JS}.length >= 6`,
-    60000,
+    150000,
     emitStatus,
   )
 }
@@ -363,14 +366,27 @@ async function runQwenRegistrationInner(deps: QwenRegisterDeps): Promise<{ addre
  * Public entry: runs the registration automation while a global puzzle
  * watcher guards the window for the whole flow — the captcha can pop up at
  * any step (initial form, address submit, code submit), not only inside the
- * two wait loops. The watcher is stopped when the flow ends so a window
- * left open for manual completion is not disturbed by synthetic drags.
+ * two wait loops.
+ *
+ * Watcher lifetime: it is stopped on SUCCESS (the token is captured and the
+ * window closes). On FAILURE the login window is deliberately left open so
+ * the user can finish manually — and a fresh puzzle image very often appears
+ * right after a failed attempt. Stopping the watcher there is what caused
+ * "验证失败重新出了验证图不会接着认证" (the new puzzle sat unattended). We now
+ * KEEP the watcher running on failure so it keeps solving any new puzzle; it
+ * auto-stops when the window is destroyed.
  */
 export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ address: string }> {
   const stopWatcher = startPuzzleWatcher(deps.webContents, deps.emitStatus)
   try {
-    return await runQwenRegistrationInner(deps)
-  } finally {
+    const result = await runQwenRegistrationInner(deps)
     stopWatcher()
+    return result
+  } catch (error) {
+    console.warn(
+      '[QwenRegister] flow failed; keeping puzzle watcher active so the window keeps auto-solving new captchas:',
+      error instanceof Error ? error.message : error,
+    )
+    throw error
   }
 }

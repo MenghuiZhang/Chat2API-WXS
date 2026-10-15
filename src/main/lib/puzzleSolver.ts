@@ -54,6 +54,8 @@ export interface PuzzleGeometry {
   bgAltVia?: string
   /** Current center X of the movable puzzle piece (main-frame coords) */
   pieceCenterX?: number
+  /** Rendered width of the movable puzzle piece in CSS px */
+  pieceWidth?: number
   /** Center of the puzzle refresh button (main-frame coords), if found */
   refreshX?: number
   refreshY?: number
@@ -360,6 +362,7 @@ export function puzzleProbeScript(): string {
         handleFound: how,
         slideImage: slideImage || undefined,
         pieceCenterX: pieceRect ? pieceRect.x + pieceRect.width / 2 : undefined,
+        pieceWidth: pieceRect ? pieceRect.width : undefined,
         refreshX: refreshRect ? refreshRect.x + refreshRect.width / 2 : undefined,
         refreshY: refreshRect ? refreshRect.y + refreshRect.height / 2 : undefined,
         failed: failed || undefined,
@@ -627,8 +630,12 @@ export interface DragPlan {
   gapCenterDom: number
   /** piece center (or track-start assumption) in viewport-absolute CSS px */
   pieceStart: number
-  /** drag delta in CSS px */
+  /** required PIECE displacement in CSS px */
   distance: number
+  /** handle-travel / piece-travel stroke ratio (1 when unknown or equal) */
+  ratio: number
+  /** required HANDLE displacement in CSS px = distance * ratio */
+  handleDistance: number
 }
 
 export function planDrag(
@@ -637,6 +644,8 @@ export function planDrag(
     bgNaturalWidth: number
     bgOffsetX: number
     handleWidth: number
+    trackWidth?: number
+    pieceWidth?: number
     pieceCenterX?: number
   },
   resultX: number,
@@ -659,7 +668,32 @@ export function planDrag(
     typeof geo.pieceCenterX === 'number' && geo.pieceCenterX < gapCenterDom - 5
       ? geo.pieceCenterX
       : geo.bgOffsetX + geo.handleWidth / 2
-  return { scale, gapCenterDom, pieceStart, distance: gapCenterDom - pieceStart }
+  const distance = gapCenterDom - pieceStart
+
+  // `distance` is how far the PIECE must travel. The handle is dragged
+  // instead, and the two strokes are only equal when the handle's full range
+  // (trackWidth - handleWidth) matches the piece's full range
+  // (bgWidth - pieceWidth). When they differ the widget maps handle travel
+  // onto piece travel proportionally, so dragging the handle by `distance`
+  // lands the piece short/long by that ratio — the residual "差一点" left
+  // after v1.7.9 fixed the coordinate origin. Convert piece -> handle.
+  const pieceTravel =
+    typeof geo.pieceWidth === 'number' && geo.bgWidth > geo.pieceWidth + 8
+      ? geo.bgWidth - geo.pieceWidth
+      : 0
+  const handleTravel =
+    typeof geo.trackWidth === 'number' && geo.trackWidth > geo.handleWidth + 8
+      ? geo.trackWidth - geo.handleWidth
+      : 0
+  let ratio = pieceTravel > 0 && handleTravel > 0 ? handleTravel / pieceTravel : 1
+  if (!Number.isFinite(ratio) || ratio <= 0) ratio = 1
+  ratio = Math.max(0.2, Math.min(5, ratio))
+  let handleDistance = distance * ratio
+  // Never ask the handle for more than its physical stroke; the widget
+  // clamps it anyway and an over-long trajectory just looks robotic.
+  if (handleTravel > 0 && handleDistance > handleTravel) handleDistance = handleTravel
+
+  return { scale, gapCenterDom, pieceStart, distance, ratio, handleDistance }
 }
 
 /**
@@ -833,9 +867,11 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     }
 
     // Scale the recognized gap X (submitted image pixels) to DOM pixels and
-    // map it into viewport-absolute CSS px (see planDrag).
+    // map it into viewport-absolute CSS px (see planDrag). planDrag also
+    // converts the required PIECE displacement into the HANDLE displacement
+    // when the two strokes differ.
     const plan = planDrag(geo, result.x, geo.bgImage)
-    const { scale, gapCenterDom, pieceStart, distance } = plan
+    const { scale, gapCenterDom, pieceStart, distance, ratio, handleDistance } = plan
     if (!Number.isFinite(distance) || distance < 5) {
       // Gap recognized at/behind the track start: nothing sensible to drag.
       // Refresh for a new puzzle and retry instead of giving up silently.
@@ -845,12 +881,12 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       continue
     }
     console.log(
-      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} attempt=${attempt}`,
+      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} ratio=${ratio.toFixed(3)} handleDistance=${handleDistance.toFixed(1)} pieceW=${geo.pieceWidth ?? 'n/a'} track=${geo.trackWidth} handle=${geo.handleWidth} attempt=${attempt}`,
     )
     onStatus('Geepass 识别成功，正在拖动滑块…')
 
     await sleep(300 + Math.random() * 400)
-    await dragHandle(wc, geo, distance)
+    await dragHandle(wc, geo, handleDistance)
     if (await verify()) {
       console.log('[PuzzleSolver] Puzzle solved')
       onStatus('拼图验证通过')
@@ -867,25 +903,65 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
   return false
 }
 
-/** Click the puzzle refresh button (small icon at the bg top-right corner). */
-async function clickPuzzleRefresh(wc: WebContents, geo: PuzzleGeometry): Promise<void> {
-  if (wc.isDestroyed()) return
-  if (typeof geo.refreshX === 'number' && typeof geo.refreshY === 'number') {
-    const x = Math.round(geo.refreshX)
-    const y = Math.round(geo.refreshY)
-    wc.sendInputEvent({ type: 'mouseMove', x, y, clickCount: 0 })
-    await sleep(60 + Math.random() * 80)
-    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
-    wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
-  } else {
-    // No refresh button found — click the background itself; several Aliyun
-    // punish variants reload the puzzle on a background click.
-    const x = Math.round(geo.bgOffsetX + geo.bgWidth / 2)
-    const y = Math.round(geo.y - geo.handleWidth * 2)
-    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
-    wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+/**
+ * Cheap content fingerprint for a base64 image, used to detect whether a
+ * refresh actually swapped the puzzle. PNG payloads share a fixed header, so
+ * the length plus a couple of interior samples distinguish distinct images
+ * without hashing the whole (often multi-hundred-KB) string.
+ */
+function imageFingerprint(b64: string): string {
+  if (!b64) return ''
+  const n = b64.length
+  const q1 = b64.slice(Math.floor(n / 4), Math.floor(n / 4) + 16)
+  const mid = b64.slice(Math.floor(n / 2), Math.floor(n / 2) + 24)
+  return `${n}:${q1}:${mid}`
+}
+
+/** Re-probe and report whether the bg image differs from `before`. */
+async function puzzleImageChanged(wc: WebContents, before: string): Promise<boolean> {
+  if (wc.isDestroyed()) return false
+  const next = await locatePuzzle(wc)
+  if (!next || !next.bgImage) return true // puzzle gone => treat as changed
+  return imageFingerprint(next.bgImage) !== before
+}
+
+/**
+ * Click the puzzle refresh button (small icon at the bg top-right corner).
+ * Verifies the image actually changed; some variants ignore the first click
+ * or auto-reload on failure, and without this check the SAME failed image
+ * gets recognized again and lands on the same spot (the "验证失败重新出了
+ * 验证图不会接着认证" symptom). Clicks at most twice. Returns true when the
+ * puzzle image changed (or the puzzle disappeared).
+ */
+async function clickPuzzleRefresh(wc: WebContents, geo: PuzzleGeometry): Promise<boolean> {
+  if (wc.isDestroyed()) return false
+  const before = imageFingerprint(geo.bgImage)
+
+  const clickOnce = async (): Promise<void> => {
+    if (typeof geo.refreshX === 'number' && typeof geo.refreshY === 'number') {
+      const x = Math.round(geo.refreshX)
+      const y = Math.round(geo.refreshY)
+      wc.sendInputEvent({ type: 'mouseMove', x, y, clickCount: 0 })
+      await sleep(60 + Math.random() * 80)
+      wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+      wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+    } else {
+      // No refresh button found — click the background itself; several Aliyun
+      // punish variants reload the puzzle on a background click.
+      const x = Math.round(geo.bgOffsetX + geo.bgWidth / 2)
+      const y = Math.round(geo.y - geo.handleWidth * 2)
+      wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+      wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+    }
+    await sleep(900 + Math.random() * 600)
   }
-  await sleep(900 + Math.random() * 600)
+
+  await clickOnce()
+  if (await puzzleImageChanged(wc, before)) return true
+  // First click did not swap the image; try once more.
+  logPuzzle('warn', 'refresh did not change the puzzle image; clicking again')
+  await clickOnce()
+  return puzzleImageChanged(wc, before)
 }
 
 // ==================== Global puzzle watcher ====================
