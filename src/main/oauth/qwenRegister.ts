@@ -19,7 +19,7 @@ import {
   getOrCreateTempAddress,
   waitForVerificationCode,
 } from './tempMail'
-import { solvePuzzle } from '../lib/puzzleSolver'
+import { solvePuzzle, startPuzzleWatcher } from '../lib/puzzleSolver'
 
 export const QWEN_REGISTER_URL = 'https://chat.qwen.ai/auth?mode=register'
 const REGISTER_URL = QWEN_REGISTER_URL
@@ -255,7 +255,7 @@ async function submitEmailForCode(
  * Throws on unrecoverable failures; the caller keeps the window open so the
  * user can finish manually.
  */
-export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ address: string }> {
+async function runQwenRegistrationInner(deps: QwenRegisterDeps): Promise<{ address: string }> {
   const { webContents: wc, emitStatus } = deps
 
   // 1. Obtain the temp mailbox first so `sinceTs` predates the code email.
@@ -327,7 +327,6 @@ export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ add
   emitStatus('注册成功，正在等待登录完成...')
   const deadline = Date.now() + 60000
   let accepted = false
-  let lastPuzzleAt = 0
   while (Date.now() < deadline) {
     if (!wcAlive(wc)) {
       accepted = true // window closed => login already completed
@@ -342,15 +341,8 @@ export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ add
       accepted = true // navigated away from the auth page
       break
     }
-    // A puzzle captcha may also guard the final submit; solve it inline.
-    if (Date.now() - lastPuzzleAt > 5000) {
-      lastPuzzleAt = Date.now()
-      await solvePuzzle(wc, {
-        onStatus: emitStatus,
-        verifySolved: async () =>
-          (await exec<boolean>(wc, `location.pathname.indexOf('/auth') < 0`)) === true,
-      })
-    }
+    // A puzzle captcha may also guard the final submit; the global watcher
+    // started in runQwenRegistration solves it inline while we poll here.
     await sleep(1000)
   }
 
@@ -365,4 +357,20 @@ export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ add
   }
 
   return { address: temp.address }
+}
+
+/**
+ * Public entry: runs the registration automation while a global puzzle
+ * watcher guards the window for the whole flow — the captcha can pop up at
+ * any step (initial form, address submit, code submit), not only inside the
+ * two wait loops. The watcher is stopped when the flow ends so a window
+ * left open for manual completion is not disturbed by synthetic drags.
+ */
+export async function runQwenRegistration(deps: QwenRegisterDeps): Promise<{ address: string }> {
+  const stopWatcher = startPuzzleWatcher(deps.webContents, deps.emitStatus)
+  try {
+    return await runQwenRegistrationInner(deps)
+  } finally {
+    stopWatcher()
+  }
 }
