@@ -237,6 +237,23 @@ test('planDrag: ratio falls back to 1 on degenerate or missing stroke data', () 
   assert.equal(fn({ ...base, trackWidth: 45, pieceWidth: 50 }, 350).ratio, 1)
 })
 
+// --- correctionDelta -------------------------------------------------------
+test('correctionDelta: closed-loop residual skips negligible and implausible values', () => {
+  const code = extractFunction('correctionDelta')
+  const fn = new Function(`${code}; return correctionDelta;`)()
+
+  // Piece landed 12px short of the gap -> nudge by +12.
+  assert.equal(fn(300, 288, 150), 12)
+  // Piece overshot by 7 -> nudge back by -7.
+  assert.equal(fn(300, 307, 150), -7)
+  // Negligible residual (<=2px) -> no correction.
+  assert.equal(fn(300, 299, 150), 0)
+  assert.equal(fn(300, 302, 150), 0)
+  // Implausibly large (piece reset to start / drag rejected) -> no nudge;
+  // the next attempt re-drags from scratch instead.
+  assert.equal(fn(300, 60, 150), 0, 'residual > cap must not nudge')
+})
+
 // --- puzzleProbeScript -----------------------------------------------------
 test('puzzleProbeScript: returned string is syntactically valid JavaScript', () => {
   const code = extractFunction('puzzleProbeScript')

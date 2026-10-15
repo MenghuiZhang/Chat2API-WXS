@@ -22,6 +22,30 @@ function logPuzzle(level: 'info' | 'warn' | 'error', message: string, extra?: Re
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * Race a promise against a deadline. Page-side `executeJavaScript` and the
+ * probe's in-page `fetch` have NO timeout of their own; a hung page (modal,
+ * stalled CDN request behind a proxy) would otherwise pin the caller
+ * forever — and through the activeSolves dedupe map also pin the global
+ * watcher's `busy` flag, which is exactly the "failed once, never retries
+ * again" freeze. Resolve with `fallback` when the deadline passes.
+ */
+function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    p.finally(() => {
+      if (timer) clearTimeout(timer)
+    }),
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => {
+        logPuzzle('warn', `${label} timed out after ${ms}ms`)
+        console.warn(`[PuzzleSolver] ${label} timed out after ${ms}ms`)
+        resolve(fallback)
+      }, ms)
+    }),
+  ])
+}
+
 /** In-flight solve attempts per webContents (concurrent callers dedupe). */
 const activeSolves = new Map<WebContents, Promise<boolean>>()
 
@@ -385,7 +409,15 @@ export async function locatePuzzle(
     visited.add(key)
 
     try {
-      const geo: any = await frame.executeJavaScript(puzzleProbeScript())
+      // Bounded: the probe awaits in-page fetch() for the bg bytes, which can
+      // stall for minutes behind a proxy. A dead frame must not block the
+      // walk (and thus the watcher tick) — fall through to child frames.
+      const geo: any = await withDeadline(
+        frame.executeJavaScript(puzzleProbeScript()),
+        10000,
+        null,
+        'probe executeJavaScript',
+      )
       if (geo && typeof geo.x === 'number' && geo.bgImage) {
         return {
           ...geo,
@@ -744,6 +776,22 @@ export interface SolvePuzzleOptions {
   verifySolved?: () => Promise<boolean>
   /** Drag attempts before giving up (default 3; each retry refreshes the puzzle). */
   maxAttempts?: number
+  /** Hard watchdog for the whole solve (default 150s); releases the dedupe entry on timeout. */
+  totalTimeoutMs?: number
+}
+
+/**
+ * Closed-loop residual: how far the piece still is from the gap AFTER a
+ * drag, measured from the live DOM instead of assumed from mapping math.
+ * Returns 0 when the residual is negligible (<=2px) or implausibly large
+ * (the drag was rejected outright / the piece reset — the next attempt
+ * re-drags from scratch on a fresh image instead of nudging).
+ */
+export function correctionDelta(gapCenterDom: number, pieceNow: number, distance: number): number {
+  const residual = gapCenterDom - pieceNow
+  const cap = Math.max(60, distance * 0.75)
+  if (Math.abs(residual) <= 2 || Math.abs(residual) > cap) return 0
+  return residual
 }
 
 /**
@@ -762,8 +810,18 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
 
   const run = solvePuzzleInner(wc, options)
   activeSolves.set(wc, run)
+  // Hard watchdog: even with per-probe deadlines a pathological sequence can
+  // overrun; when it does, release the dedupe entry so the next watcher tick
+  // starts a FRESH attempt instead of awaiting the stuck promise forever.
+  const watchdog = new Promise<boolean>((resolve) => {
+    setTimeout(() => {
+      logPuzzle('warn', 'solve watchdog fired; releasing dedupe entry for a fresh attempt')
+      console.warn('[PuzzleSolver] solve watchdog fired; releasing dedupe entry')
+      resolve(false)
+    }, options.totalTimeoutMs ?? 150000)
+  })
   try {
-    return await run
+    return await Promise.race([run, watchdog])
   } finally {
     if (activeSolves.get(wc) === run) activeSolves.delete(wc)
   }
@@ -779,7 +837,12 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // Puzzle gone (modal dismissed / page navigated) means solved.
     if (!(await locatePuzzle(wc))) return true
     try {
-      const body = await wc.executeJavaScript(`document.body ? (document.body.innerText || '') : ''`)
+      const body = await withDeadline(
+        wc.executeJavaScript(`document.body ? (document.body.innerText || '') : ''`),
+        6000,
+        '',
+        'verify innerText',
+      )
       return /验证成功|验证通过|校验成功|验证已完成/.test(String(body || ''))
     } catch {
       return false
@@ -810,6 +873,21 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // Original-byte fallbacks (Linux tainted canvas) must be re-encoded as
     // fitted PNGs here, otherwise Geepass rejects the payload.
     ensureSubmissionNormalized(geo)
+
+    // A leftover failure banner means the CURRENT image was already tried
+    // and rejected — recognizing it again just reproduces the same bad drag
+    // ("失败也没有重试" is really "retried the same dead image"). Swap to a
+    // fresh image before spending a recognition call on it.
+    if (geo.failed) {
+      console.log('[PuzzleSolver] failure banner present; refreshing before recognition')
+      logPuzzle('info', 'failure banner present; refreshing before recognition')
+      await clickPuzzleRefresh(wc, geo)
+      const refreshed = await locatePuzzle(wc)
+      if (refreshed && refreshed.bgImage) {
+        Object.assign(geo, refreshed)
+        ensureSubmissionNormalized(geo)
+      }
+    }
 
     if (attempt === 1) {
       onStatus('检测到拼图验证，Geepass 正在识别缺口…')
@@ -887,6 +965,27 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
 
     await sleep(300 + Math.random() * 400)
     await dragHandle(wc, geo, handleDistance)
+
+    // Closed-loop correction: measure where the piece ACTUALLY landed and
+    // nudge the handle by the residual. Every mapping assumption (submitted
+    // image scale, stroke ratio, frame offsets) can be slightly off; the
+    // rendered piece is the ground truth. correctionDelta skips negligible
+    // residuals and implausibly large ones (drag rejected / piece reset).
+    await sleep(500 + Math.random() * 300)
+    const landed = await locatePuzzle(wc)
+    if (landed && typeof landed.pieceCenterX === 'number') {
+      const residual = correctionDelta(gapCenterDom, landed.pieceCenterX, distance)
+      if (residual !== 0) {
+        console.log(
+          `[PuzzleSolver] closed-loop correction residual=${residual.toFixed(1)} pieceNow=${landed.pieceCenterX.toFixed(1)} gapCenterDom=${gapCenterDom.toFixed(1)} attempt=${attempt}`,
+        )
+        logPuzzle('info', `closed-loop correction residual=${residual.toFixed(1)} pieceNow=${landed.pieceCenterX.toFixed(1)} attempt=${attempt}`)
+        onStatus('落点微调中…')
+        await dragHandle(wc, landed, residual * ratio)
+        await sleep(400 + Math.random() * 300)
+      }
+    }
+
     if (await verify()) {
       console.log('[PuzzleSolver] Puzzle solved')
       onStatus('拼图验证通过')
