@@ -613,6 +613,56 @@ function isBlankImage(b64: string): boolean {
 }
 
 /**
+ * Map the recognized gap center (submitted-image pixels) onto a DOM drag
+ * distance. Every rect the page probe returns is viewport-ABSOLUTE CSS px,
+ * so the gap center must first be offset by the bg element's own X before
+ * subtracting the piece's absolute start position. Forgetting bgOffsetX
+ * under-dragged by exactly that margin (the v1.7.8 "piece lands at ~half
+ * the gap" bug the Geepass support thread pointed at).
+ */
+export interface DragPlan {
+  /** submitted-image px -> DOM px ratio */
+  scale: number
+  /** gap center in viewport-absolute CSS px */
+  gapCenterDom: number
+  /** piece center (or track-start assumption) in viewport-absolute CSS px */
+  pieceStart: number
+  /** drag delta in CSS px */
+  distance: number
+}
+
+export function planDrag(
+  geo: {
+    bgWidth: number
+    bgNaturalWidth: number
+    bgOffsetX: number
+    handleWidth: number
+    pieceCenterX?: number
+  },
+  resultX: number,
+  bgImage?: string,
+): DragPlan {
+  // When the page handed over ORIGINAL bytes (bgVia dataurl/fetch) the
+  // submitted width may be 0, so decode the real pixel width from headers.
+  const natural =
+    geo.bgNaturalWidth > 0
+      ? geo.bgNaturalWidth
+      : (bgImage ? decodeImageWidth(bgImage) : 0) || geo.bgWidth
+  const scale = natural > 0 ? geo.bgWidth / natural : 1
+  const gapCenterDom = geo.bgOffsetX + resultX * scale
+  // The drag delta moves the piece's CURRENT center onto the gap center.
+  // After a failed attempt the piece does not snap back to the track start,
+  // so using its live position keeps the delta exact. Sanity: the piece must
+  // sit LEFT of the recognized gap; otherwise the detected 'piece' was
+  // really the gap overlay and we fall back to the track-start assumption.
+  const pieceStart =
+    typeof geo.pieceCenterX === 'number' && geo.pieceCenterX < gapCenterDom - 5
+      ? geo.pieceCenterX
+      : geo.bgOffsetX + geo.handleWidth / 2
+  return { scale, gapCenterDom, pieceStart, distance: gapCenterDom - pieceStart }
+}
+
+/**
  * Ensure the images about to be submitted are fitted PNGs. Canvas-path
  * images already are; original-byte fallbacks are converted here. Mutates
  * the geometry in place (bgNaturalWidth becomes the submitted pixel width).
@@ -782,26 +832,10 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       return false
     }
 
-    // Scale the recognized gap X (submitted image pixels) to DOM pixels.
-    // When the page handed over ORIGINAL bytes (bgVia dataurl/fetch) the
-    // submitted width is 0, so decode the real pixel width from the header.
-    const natural = geo.bgNaturalWidth > 0 ? geo.bgNaturalWidth : decodeImageWidth(geo.bgImage) || geo.bgWidth
-    const scale = natural > 0 ? geo.bgWidth / natural : 1
-    const gapCenterDom = result.x * scale
-
-    // The drag delta moves the piece's CURRENT center onto the gap center.
-    // After a failed attempt the piece does not snap back to the track
-    // start, so using its live position keeps the delta exact. When the
-    // piece element is not detected, fall back to the old assumption that
-    // the piece starts at the left edge of the track.
-    // Sanity: the piece must sit LEFT of the recognized gap; otherwise the
-    // detected 'piece' was really the gap overlay and we fall back to the
-    // track-start assumption.
-    const pieceStart =
-      typeof geo.pieceCenterX === 'number' && geo.pieceCenterX < gapCenterDom - 5
-        ? geo.pieceCenterX
-        : geo.bgOffsetX + geo.handleWidth / 2
-    const distance = gapCenterDom - pieceStart
+    // Scale the recognized gap X (submitted image pixels) to DOM pixels and
+    // map it into viewport-absolute CSS px (see planDrag).
+    const plan = planDrag(geo, result.x, geo.bgImage)
+    const { scale, gapCenterDom, pieceStart, distance } = plan
     if (!Number.isFinite(distance) || distance < 5) {
       // Gap recognized at/behind the track start: nothing sensible to drag.
       // Refresh for a new puzzle and retry instead of giving up silently.
@@ -811,7 +845,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       continue
     }
     console.log(
-      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} attempt=${attempt}`,
+      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} attempt=${attempt}`,
     )
     onStatus('Geepass 识别成功，正在拖动滑块…')
 

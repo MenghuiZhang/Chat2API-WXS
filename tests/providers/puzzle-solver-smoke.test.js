@@ -126,6 +126,61 @@ test('humanTrajectory: ends exactly at target distance, midpoints overshoot', ()
   }
 })
 
+// --- planDrag --------------------------------------------------------------
+// planDrag delegates header decoding to decodeImageWidth; inject both.
+function extractPlanDrag() {
+  const code = extractFunction('planDrag') + '\n' + extractFunction('decodeImageWidth')
+  return new Function(`${code}; return planDrag;`)()
+}
+
+test('planDrag: gap center is mapped into viewport-absolute CSS px', () => {
+  const fn = extractPlanDrag()
+
+  // bg element sits at viewport x=430, rendered 200 CSS px wide while the
+  // submitted image is 400 px -> scale 0.5. Gap at image x=350 -> 175 CSS px
+  // INSIDE the bg -> absolute 605. Piece currently centered at 450.
+  const geo = { bgWidth: 200, bgNaturalWidth: 400, bgOffsetX: 430, handleWidth: 40, pieceCenterX: 450 }
+  const plan = fn(geo, 350)
+  assert.equal(plan.scale, 0.5)
+  assert.equal(plan.gapCenterDom, 605, 'bgOffsetX must be added to the scaled gap X')
+  assert.equal(plan.pieceStart, 450)
+  assert.equal(plan.distance, 155)
+})
+
+test('planDrag: falls back to track start when piece is right of the gap', () => {
+  const fn = extractPlanDrag()
+
+  const geo = { bgWidth: 200, bgNaturalWidth: 400, bgOffsetX: 430, handleWidth: 40, pieceCenterX: 604 }
+  const plan = fn(geo, 350)
+  assert.equal(plan.pieceStart, 430 + 20, 'track-start assumption when piece not left of gap')
+  assert.equal(plan.distance, 605 - 450)
+})
+
+test('planDrag: decodes submitted width from image header when unknown', () => {
+  const fn = extractPlanDrag()
+
+  const header = Buffer.alloc(32)
+  header[0] = 0x89; header[1] = 0x50; header[2] = 0x4e; header[3] = 0x47
+  header[4] = 0x0d; header[5] = 0x0a; header[6] = 0x1a; header[7] = 0x0a
+  header.writeUInt32BE(13, 8)
+  header.write('IHDR', 12, 'ascii')
+  header.writeUInt32BE(400, 16)
+  header.writeUInt32BE(200, 20)
+
+  const geo = { bgWidth: 200, bgNaturalWidth: 0, bgOffsetX: 100, handleWidth: 40 }
+  const plan = fn(geo, 350, header.toString('base64'))
+  assert.equal(plan.scale, 0.5, 'natural width decoded from PNG header')
+  assert.equal(plan.gapCenterDom, 100 + 175)
+})
+
+test('planDrag: implausible distance when gap sits at the track start', () => {
+  const fn = extractPlanDrag()
+
+  const geo = { bgWidth: 200, bgNaturalWidth: 400, bgOffsetX: 430, handleWidth: 40, pieceCenterX: 450 }
+  const plan = fn(geo, 10) // gap almost at bg left edge
+  assert.ok(plan.distance < 5, `distance must be implausible (got ${plan.distance})`)
+})
+
 // --- puzzleProbeScript -----------------------------------------------------
 test('puzzleProbeScript: returned string is syntactically valid JavaScript', () => {
   const code = extractFunction('puzzleProbeScript')
