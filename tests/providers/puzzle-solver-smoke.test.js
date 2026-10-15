@@ -132,12 +132,17 @@ test('puzzleProbeScript: returned string is syntactically valid JavaScript', () 
   const fn = new Function(`${code}; return puzzleProbeScript;`)()
 
   const scriptText = fn()
-  // Puzzle probe is wrapped in a template literal\\; ensure the literal
-  // unwrapping produces parseable JS by passing it to `new Function`.
-  // The script is an async IIFE — wrap in function body for parse check.
+  // The probe script is built from a template literal; backslash escapes get
+  // "cooked" (e.g. /url\(/ inside the template becomes /url(/ in the string,
+  // which is an unterminated regex group). Parse the COOKED script for real
+  // to catch such bugs — this previously shipped broken in v1.7.5-v1.7.7.
   assert.doesNotThrow(() => {
-    new Function(`return (0, async function*(){})() || ${JSON.stringify(scriptText)};`)
-  })
+    new Function(scriptText)
+  }, 'cooked probe script must be parseable JavaScript')
+
+  // Regression: the background-image url regexes must survive template cooking.
+  assert.ok(scriptText.includes('/url\\(/'), 'L199 url regex keeps its escape after cooking')
+  assert.match(scriptText, /url\\\(\["'\]/, 'grabBytes url regex keeps its escapes after cooking')
 
   // Sanity: script contains the key probes we rely on.
   assert.match(scriptText, /拖动滑块|slide.*complete/i, 'has Chinese/English slider hints')
@@ -171,8 +176,12 @@ test('puzzleProbeScript: returned string is syntactically valid JavaScript', () 
   const fn = new Function(`${code}; return puzzleProbeScript;`)()
   const scriptText = fn()
   assert.ok(
-    /if \(seen\.size < 3\) return ''/.test(scriptText),
-    'blank canvas detection returns empty string',
+    /blank = seen\.size < 3/.test(scriptText),
+    'blank canvas sampling sets a suspicion flag (no early discard)',
+  )
+  assert.ok(
+    !/if \(seen\.size < 3\) return ''/.test(scriptText),
+    'canvas result is no longer discarded on page-side blank suspicion',
   )
   // Confirm the script still exposes MAXD/MIND for Geepass bounds
   assert.match(scriptText, /const MAXD = 1024, MIND = 50/)

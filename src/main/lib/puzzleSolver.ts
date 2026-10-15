@@ -44,8 +44,14 @@ export interface PuzzleGeometry {
   bgOffsetX: number
   /** How the drag handle was detected (selector/text/structure) — diagnostics */
   handleFound?: string
-  /** How the background bytes were obtained (canvas/dataurl/fetch) */
+  /** How the background bytes were obtained (canvas/dataurl/fetch/bytes) */
   bgVia?: string
+  /** Page-side pixel sampling looked blank; main process must confirm */
+  bgBlankSuspect?: boolean
+  /** Original-byte alternative captured when the canvas looked blank */
+  bgAltImage?: string
+  /** How bgAltImage was obtained (dataurl/fetch) */
+  bgAltVia?: string
   /** Current center X of the movable puzzle piece (main-frame coords) */
   pieceCenterX?: number
   /** Center of the puzzle refresh button (main-frame coords), if found */
@@ -190,7 +196,10 @@ export function puzzleProbeScript(): string {
         if (b.right < bgb.left - 30 || b.left > bgb.right + 30) return false;
         if (el.tagName !== 'IMG' && el.tagName !== 'CANVAS') {
           const bi = getComputedStyle(el).backgroundImage || '';
-          if (!/url\(/.test(bi)) return false;
+          // NOTE: this is inside a template string; backslashes get cooked,
+          // so regex escapes must be doubled (\\( -> \() or the whole probe
+          // script fails with SyntaxError in the page.
+          if (!/url\\(/.test(bi)) return false;
         }
         return true;
       });
@@ -250,9 +259,11 @@ export function puzzleProbeScript(): string {
         c.height = Math.max(1, Math.round(natH * s));
         const ctx = c.getContext('2d');
         ctx.drawImage(el, 0, 0, c.width, c.height);
-        // Some Linux builds yield a BLANK (fully transparent) canvas instead
-        // of throwing on tainted draws; a blank PNG is billed-but-failed at
-        // the service. Sample pixels and bail out to the byte fallbacks.
+        // Some Linux builds return ZEROED pixels from getImageData while
+        // toDataURL still encodes the real image (or vice versa). Sampling
+        // is only a SUSPICION flag now; the main process re-checks the
+        // encoded PNG with nativeImage before discarding it.
+        let blank = false;
         try {
           const d = ctx.getImageData(0, 0, c.width, c.height).data;
           const seen = new Set();
@@ -261,42 +272,59 @@ export function puzzleProbeScript(): string {
             seen.add((d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3]);
             if (seen.size > 8) break;
           }
-          if (seen.size < 3) return '';
+          blank = seen.size < 3;
         } catch (e) { /* tainted: toDataURL below throws anyway */ }
-        return c.toDataURL('image/png').split(',')[1] || '';
+        return { b64: c.toDataURL('image/png').split(',')[1] || '', blank };
       };
       // Fallback when drawImage throws (tainted canvas) or yields nothing:
       // hand the ORIGINAL bytes over; the main process then decodes the real
       // pixel width from the image header and scales coordinates itself.
+      const grabBytes = async (el) => {
+        // IMG src or, for div/span pieces, the CSS background-image url.
+        // Regex backslashes are doubled because this lives inside a template
+        // string where \( gets cooked into ( -> /url(/ would be an
+        // unterminated group and crash the whole probe script in the page.
+        const src =
+          el.tagName === 'IMG'
+            ? (el.currentSrc || el.src || '')
+            : ((/url\\(["']?(.*?)["']?\\)/.exec(getComputedStyle(el).backgroundImage || '') || [])[1] || '');
+        if (src.startsWith('data:')) {
+          const i = src.indexOf(',');
+          if (i > 0) return { b64: src.slice(i + 1), via: 'dataurl' };
+        } else if (/^https?:/.test(src)) {
+          try {
+            const resp = await fetch(src, { credentials: 'include' });
+            if (resp.ok) {
+              const buf = await resp.arrayBuffer();
+              let bin = '';
+              const u8 = new Uint8Array(buf);
+              for (let i = 0; i < u8.length; i += 0x8000) {
+                bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+              }
+              return { b64: btoa(bin), via: 'fetch' };
+            }
+          } catch (e) { /* cors; fall through */ }
+        }
+        return { b64: '', via: 'none' };
+      };
       const grab = async (el, natW, natH, s) => {
         let b64 = '';
-        try { b64 = draw(el, natW, natH, s); } catch (e) { b64 = ''; }
-        if (b64 && b64.length > 100) return { b64, w: Math.max(1, Math.round(natW * s)), via: 'canvas' };
-        {
-          // IMG src or, for div/span pieces, the CSS background-image url.
-          const src =
-            el.tagName === 'IMG'
-              ? (el.currentSrc || el.src || '')
-              : ((/url\(["']?(.*?)["']?\)/.exec(getComputedStyle(el).backgroundImage || '') || [])[1] || '');
-          if (src.startsWith('data:')) {
-            const i = src.indexOf(',');
-            if (i > 0) return { b64: src.slice(i + 1), w: 0, via: 'dataurl' };
-          } else if (/^https?:/.test(src)) {
-            try {
-              const resp = await fetch(src, { credentials: 'include' });
-              if (resp.ok) {
-                const buf = await resp.arrayBuffer();
-                let bin = '';
-                const u8 = new Uint8Array(buf);
-                for (let i = 0; i < u8.length; i += 0x8000) {
-                  bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-                }
-                return { b64: btoa(bin), w: 0, via: 'fetch' };
-              }
-            } catch (e) { /* cors; fall through */ }
+        let blank = false;
+        try { const r = draw(el, natW, natH, s); b64 = r.b64; blank = r.blank; } catch (e) { b64 = ''; }
+        if (b64 && b64.length > 100) {
+          // Pixels looked blank: KEEP the canvas PNG (it may still be good)
+          // but also capture the original bytes so the main process can
+          // switch if nativeImage confirms the blankness.
+          let alt = '';
+          let altVia = '';
+          if (blank) {
+            const a = await grabBytes(el);
+            if (a.b64.length > 100) { alt = a.b64; altVia = a.via; }
           }
+          return { b64, w: Math.max(1, Math.round(natW * s)), via: 'canvas', blank, alt, altVia };
         }
-        return { b64: '', w: 0, via: 'none' };
+        const a = await grabBytes(el);
+        return { b64: a.b64, w: 0, via: a.via, blank: false, alt: '', altVia: '' };
       };
 
       const natW = bg.tagName === 'CANVAS' ? bg.width : (bg.naturalWidth || Math.round(bgb.width));
@@ -326,6 +354,9 @@ export function puzzleProbeScript(): string {
         bgOffsetX: bgb.x,
         bgImage: g.b64,
         bgVia: g.via,
+        bgBlankSuspect: g.blank || undefined,
+        bgAltImage: g.alt || undefined,
+        bgAltVia: g.altVia || undefined,
         handleFound: how,
         slideImage: slideImage || undefined,
         pieceCenterX: pieceRect ? pieceRect.x + pieceRect.width / 2 : undefined,
@@ -351,7 +382,7 @@ export async function locatePuzzle(
     visited.add(key)
 
     try {
-      const geo = await frame.executeJavaScript(puzzleProbeScript())
+      const geo: any = await frame.executeJavaScript(puzzleProbeScript())
       if (geo && typeof geo.x === 'number' && geo.bgImage) {
         return {
           ...geo,
@@ -373,7 +404,7 @@ export async function locatePuzzle(
     }
 
     for (const child of frame.frames) {
-      const node = child.frameTreeNode
+      const node = (child as any).frameTreeNode
       const result = await walk(child, offsetX + (node?.offsetX || 0), offsetY + (node?.offsetY || 0))
       if (result) return result
     }
@@ -556,11 +587,55 @@ function normalizeForGeepass(b64: string): { b64: string; width: number; height:
 const PNG_B64_PREFIX = 'iVBORw0KGgo'
 
 /**
+ * Sample decoded pixels via nativeImage.toBitmap() to confirm whether an
+ * image is truly blank. The page-side getImageData sampling is unreliable
+ * on some Linux builds (zeroed readback while toDataURL encodes fine), so
+ * a suspicion must be verified here before discarding a good canvas PNG.
+ */
+function isBlankImage(b64: string): boolean {
+  try {
+    let img = nativeImage.createFromBuffer(Buffer.from(b64, 'base64'))
+    if (img.isEmpty()) img = nativeImage.createFromDataURL(`data:image/png;base64,${b64}`)
+    if (img.isEmpty()) img = nativeImage.createFromDataURL(`data:image/jpeg;base64,${b64}`)
+    if (img.isEmpty()) return true
+    const bmp = img.toBitmap()
+    if (!bmp || bmp.length < 8) return true
+    const seen = new Set<number>()
+    const step = Math.max(4, Math.floor(bmp.length / 16384 / 4) * 4)
+    for (let i = 0; i + 3 < bmp.length; i += step) {
+      seen.add((bmp[i] << 24) | (bmp[i + 1] << 16) | (bmp[i + 2] << 8) | bmp[i + 3])
+      if (seen.size > 8) break
+    }
+    return seen.size < 3
+  } catch {
+    return false
+  }
+}
+
+/**
  * Ensure the images about to be submitted are fitted PNGs. Canvas-path
  * images already are; original-byte fallbacks are converted here. Mutates
  * the geometry in place (bgNaturalWidth becomes the submitted pixel width).
  */
 function ensureSubmissionNormalized(geo: PuzzleGeometry): void {
+  // Resolve page-side blank suspicion with nativeImage pixels; switch to
+  // the original-byte alternative only when the canvas PNG is truly blank.
+  if (geo.bgVia === 'canvas' && geo.bgBlankSuspect) {
+    if (isBlankImage(geo.bgImage)) {
+      if (geo.bgAltImage && geo.bgAltImage.length > 100) {
+        logPuzzle('warn', `canvas bg confirmed blank; switching to ${geo.bgAltVia || 'bytes'} fallback`)
+        geo.bgImage = geo.bgAltImage
+        geo.bgNaturalWidth = 0
+        geo.bgVia = geo.bgAltVia || 'bytes'
+      } else {
+        logPuzzle('warn', 'canvas bg confirmed blank but no byte fallback available')
+      }
+    } else {
+      logPuzzle('info', 'canvas bg blank-suspect cleared by nativeImage pixel check')
+    }
+    geo.bgBlankSuspect = false
+    geo.bgAltImage = undefined
+  }
   if (geo.bgNaturalWidth <= 0 || !geo.bgImage.startsWith(PNG_B64_PREFIX)) {
     const before = geo.bgImage.length
     const norm = normalizeForGeepass(geo.bgImage)
