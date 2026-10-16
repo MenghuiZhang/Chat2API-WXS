@@ -985,7 +985,19 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
   })
 
   ipcMain.handle(IpcChannels.LOGS_EXPORT, async (_, format?: 'json' | 'txt'): Promise<string> => {
-    return storeManager.exportLogs(format)
+    const { app } = await import('electron')
+    const fs = await import('fs/promises')
+    const path = await import('path')
+    
+    const content = storeManager.exportLogs(format)
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5)
+    const ext = format === 'json' ? 'json' : 'txt'
+    const filename = `app-logs-${timestamp}.${ext}`
+    
+    const downloadsPath = path.join(app.getPath('downloads'), filename)
+    await fs.writeFile(downloadsPath, content, 'utf-8')
+    
+    return downloadsPath
   })
 
   ipcMain.handle(IpcChannels.LOGS_GET_BY_ID, async (_, id: string): Promise<LogEntry | undefined> => {

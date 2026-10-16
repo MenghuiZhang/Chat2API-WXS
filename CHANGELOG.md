@@ -2,6 +2,20 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
+## [1.7.14] - 2026-10-16
+
+### 🐛 修复 (Bug Fixes)
+
+- **日志页加载错误（React Minified Error #310）**：应用日志详情模态框错用了 `LogDetailModal`（参数要求 `RequestLogEntry`）而实际传入 `LogEntry`，类型不匹配导致条件渲染 Hooks 数量不一致→ 应用日志标签页打不开。现改用 `LogDetail` Sheet 组件（原生支持 `LogEntry`）
+- **导出日志无法保存到文件**：`LOGS_EXPORT` IPC handler 原本只返回 JSON 字符串，UI 拿到内容无处存放。现在 handler 会将日志写入用户下载目录（`app-logs-{ISO时间戳}.json` / `.txt`）并返回完整路径，Toast 提示「已导出至: …」
+
+### ✨ 新功能 (Features)
+
+- **应用日志标签页新增「导出全部」按钮**：点击即导出当前所有应用日志到下载文件夹（JSON 格式，含时间戳），便于批量取日志诊断问题（如拼图求解残差 / 缩放比例行）
+- **补齐 i18n 导出键**：新增 `logs.exportAll` / `logs.exporting` / `logs.exportedTo` / `logs.exportNotAvailable` 三语言翻译（中文 / English / Русский）
+
+---
+
 ## [1.7.13] - 2026-10-15
 
 ### 🐛 修复 (Bug Fixes)
