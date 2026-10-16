@@ -45,9 +45,11 @@ const MIN_LOGIN_TIME = 5000 // Minimum time before checking tokens (5 seconds)
 const MAX_LOAD_RETRIES = 3 // Maximum number of retry attempts for page loading
 const LOAD_RETRY_DELAY = 2000 // Delay between retry attempts (ms)
 // When the automatic registration flow fails, keep the window open for a
-// short grace period (so the user can finish manually), then auto-fail
-// instead of hanging until the full login timeout expires.
-const REGISTER_FAIL_GRACE_MS = 30000
+// grace period so the user can finish manually AND the retained puzzle
+// watcher keeps solving freshly-refreshed captchas ("换图后接着认证"); then
+// auto-fail instead of hanging until the full login timeout expires. The
+// window is closed on completion, so this grace bounds the watcher's life.
+const REGISTER_FAIL_GRACE_MS = 120000
 
 // Common User-Agent string for the in-app login window.
 // Many provider websites reject or block the default Electron User-Agent,

@@ -126,6 +126,24 @@ test('humanTrajectory: ends exactly at target distance, midpoints overshoot', ()
   }
 })
 
+test('humanTrajectory: negative distance (pull-back nudge) overshoots backwards', () => {
+  const code = extractFunction('humanTrajectory')
+  const fn = new Function(`${code}; return humanTrajectory;`)()
+
+  for (const target of [-12, -40]) {
+    const pts = fn(target)
+    const last = pts[pts.length - 1]
+    assert.equal(last.dx, target, 'final point equals negative target')
+    assert.equal(last.dy, 0)
+    // Overshoot must go PAST the target in the negative direction, never
+    // surge positive first (that zig-zag is what broke closed-loop nudges).
+    const minDx = Math.min(...pts.map((p) => p.dx))
+    assert.ok(minDx < target, `trajectory for ${target} undershoots (min=${minDx})`)
+    const maxDx = Math.max(...pts.map((p) => p.dx))
+    assert.ok(maxDx <= 1, `no positive surge for ${target} (max=${maxDx})`)
+  }
+})
+
 // --- planDrag --------------------------------------------------------------
 // planDrag delegates header decoding to decodeImageWidth; inject both.
 function extractPlanDrag() {
@@ -145,6 +163,9 @@ test('planDrag: gap center is mapped into viewport-absolute CSS px', () => {
   assert.equal(plan.gapCenterDom, 605, 'bgOffsetX must be added to the scaled gap X')
   assert.equal(plan.pieceStart, 450)
   assert.equal(plan.distance, 155)
+  // No trackWidth/pieceWidth supplied => strokes assumed equal.
+  assert.equal(plan.ratio, 1)
+  assert.equal(plan.handleDistance, 155)
 })
 
 test('planDrag: falls back to track start when piece is right of the gap', () => {
@@ -181,6 +202,76 @@ test('planDrag: implausible distance when gap sits at the track start', () => {
   assert.ok(plan.distance < 5, `distance must be implausible (got ${plan.distance})`)
 })
 
+test('planDrag: converts piece travel to handle travel via stroke ratio', () => {
+  const fn = extractPlanDrag()
+
+  // piece travel = bgWidth - pieceWidth = 200 - 50 = 150
+  // handle travel = trackWidth - handleWidth = 260 - 40 = 220  => ratio 220/150 > 1
+  // gap at submitted x=200 -> DOM 100; piece at 20 -> distance 80.
+  const geo = {
+    bgWidth: 200, bgNaturalWidth: 400, bgOffsetX: 0,
+    handleWidth: 40, trackWidth: 260, pieceWidth: 50, pieceCenterX: 20,
+  }
+  const plan = fn(geo, 200)
+  assert.equal(plan.distance, 80, 'piece displacement is unchanged')
+  assert.ok(Math.abs(plan.ratio - 220 / 150) < 1e-9, `ratio = handleTravel/pieceTravel (got ${plan.ratio})`)
+  assert.ok(plan.handleDistance > plan.distance, 'handle must travel FURTHER when its stroke is longer')
+  assert.ok(Math.abs(plan.handleDistance - 80 * (220 / 150)) < 1e-6, `handleDistance = distance * ratio (got ${plan.handleDistance})`)
+
+  // Inverse: handle stroke SHORTER than piece stroke => ratio < 1.
+  const geo2 = { ...geo, trackWidth: 180 } // handleTravel = 140
+  const plan2 = fn(geo2, 200)
+  assert.ok(Math.abs(plan2.ratio - 140 / 150) < 1e-9, `inverse ratio (got ${plan2.ratio})`)
+  assert.ok(plan2.handleDistance < plan2.distance, 'handle travels LESS when its stroke is shorter')
+})
+
+test('planDrag: handle distance is clamped to the physical track stroke', () => {
+  const fn = extractPlanDrag()
+
+  // Piece must travel 155 while its own stroke is only 150 (gap right at the
+  // bg edge): the converted handle distance would exceed the 220px stroke and
+  // must be clamped instead of asking for an impossible drag.
+  const geo = {
+    bgWidth: 200, bgNaturalWidth: 400, bgOffsetX: 430,
+    handleWidth: 40, trackWidth: 260, pieceWidth: 50, pieceCenterX: 450,
+  }
+  const plan = fn(geo, 350)
+  assert.equal(plan.distance, 155)
+  assert.equal(plan.handleDistance, 220, 'clamped to trackWidth - handleWidth')
+})
+
+test('planDrag: ratio falls back to 1 on degenerate or missing stroke data', () => {
+  const fn = extractPlanDrag()
+
+  const base = { bgWidth: 200, bgNaturalWidth: 400, bgOffsetX: 430, handleWidth: 40, pieceCenterX: 450 }
+
+  // pieceWidth missing => pieceTravel 0 => ratio 1.
+  assert.equal(fn({ ...base, trackWidth: 260 }, 350).ratio, 1)
+  // trackWidth missing => handleTravel 0 => ratio 1.
+  assert.equal(fn({ ...base, pieceWidth: 50 }, 350).ratio, 1)
+  // piece as wide as bg => degenerate pieceTravel => ratio 1.
+  assert.equal(fn({ ...base, trackWidth: 260, pieceWidth: 195 }, 350).ratio, 1)
+  // handle as wide as track => degenerate handleTravel => ratio 1.
+  assert.equal(fn({ ...base, trackWidth: 45, pieceWidth: 50 }, 350).ratio, 1)
+})
+
+// --- correctionDelta -------------------------------------------------------
+test('correctionDelta: closed-loop residual skips negligible and implausible values', () => {
+  const code = extractFunction('correctionDelta')
+  const fn = new Function(`${code}; return correctionDelta;`)()
+
+  // Piece landed 12px short of the gap -> nudge by +12.
+  assert.equal(fn(300, 288, 150), 12)
+  // Piece overshot by 7 -> nudge back by -7.
+  assert.equal(fn(300, 307, 150), -7)
+  // Negligible residual (<=2px) -> no correction.
+  assert.equal(fn(300, 299, 150), 0)
+  assert.equal(fn(300, 302, 150), 0)
+  // Implausibly large (piece reset to start / drag rejected) -> no nudge;
+  // the next attempt re-drags from scratch instead.
+  assert.equal(fn(300, 60, 150), 0, 'residual > cap must not nudge')
+})
+
 // --- puzzleProbeScript -----------------------------------------------------
 test('puzzleProbeScript: returned string is syntactically valid JavaScript', () => {
   const code = extractFunction('puzzleProbeScript')
@@ -204,6 +295,7 @@ test('puzzleProbeScript: returned string is syntactically valid JavaScript', () 
   assert.match(scriptText, /验证失败|请重试/, 'has failure banner text')
   assert.match(scriptText, /MAXD.*1024/, 'enforces Geepass 1024px limit')
   assert.match(scriptText, /seen\.size < 3/, 'includes blank canvas detection')
+  assert.match(scriptText, /pieceWidth:/, 'probe returns pieceWidth for the stroke-ratio correction')
 })
 
  test('puzzleProbeScript: blank-canvas detection triggers fallback to src/dataurl', () => {

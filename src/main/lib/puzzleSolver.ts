@@ -22,8 +22,42 @@ function logPuzzle(level: 'info' | 'warn' | 'error', message: string, extra?: Re
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * Race a promise against a deadline. Page-side `executeJavaScript` and the
+ * probe's in-page `fetch` have NO timeout of their own; a hung page (modal,
+ * stalled CDN request behind a proxy) would otherwise pin the caller
+ * forever — and through the activeSolves dedupe map also pin the global
+ * watcher's `busy` flag, which is exactly the "failed once, never retries
+ * again" freeze. Resolve with `fallback` when the deadline passes.
+ */
+function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    p.finally(() => {
+      if (timer) clearTimeout(timer)
+    }),
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => {
+        logPuzzle('warn', `${label} timed out after ${ms}ms`)
+        console.warn(`[PuzzleSolver] ${label} timed out after ${ms}ms`)
+        resolve(fallback)
+      }, ms)
+    }),
+  ])
+}
+
 /** In-flight solve attempts per webContents (concurrent callers dedupe). */
 const activeSolves = new Map<WebContents, Promise<boolean>>()
+
+/**
+ * Generation counter per webContents. When the solve watchdog gives up on a
+ * stuck attempt it bumps the generation; the abandoned (orphaned) inner loop
+ * notices on its next checkpoint and exits WITHOUT dragging, refreshing or
+ * emitting status. Without this the orphan keeps dragging the handle while a
+ * FRESH attempt drags it too — interleaved strokes that can never verify,
+ * which reads from the outside as "stuck on the new captcha forever".
+ */
+const solveGenerations = new Map<WebContents, number>()
 
 export interface PuzzleGeometry {
   /** Drag handle center in main-frame viewport coordinates */
@@ -54,6 +88,8 @@ export interface PuzzleGeometry {
   bgAltVia?: string
   /** Current center X of the movable puzzle piece (main-frame coords) */
   pieceCenterX?: number
+  /** Rendered width of the movable puzzle piece in CSS px */
+  pieceWidth?: number
   /** Center of the puzzle refresh button (main-frame coords), if found */
   refreshX?: number
   refreshY?: number
@@ -360,6 +396,7 @@ export function puzzleProbeScript(): string {
         handleFound: how,
         slideImage: slideImage || undefined,
         pieceCenterX: pieceRect ? pieceRect.x + pieceRect.width / 2 : undefined,
+        pieceWidth: pieceRect ? pieceRect.width : undefined,
         refreshX: refreshRect ? refreshRect.x + refreshRect.width / 2 : undefined,
         refreshY: refreshRect ? refreshRect.y + refreshRect.height / 2 : undefined,
         failed: failed || undefined,
@@ -382,7 +419,15 @@ export async function locatePuzzle(
     visited.add(key)
 
     try {
-      const geo: any = await frame.executeJavaScript(puzzleProbeScript())
+      // Bounded: the probe awaits in-page fetch() for the bg bytes, which can
+      // stall for minutes behind a proxy. A dead frame must not block the
+      // walk (and thus the watcher tick) — fall through to child frames.
+      const geo: any = await withDeadline(
+        frame.executeJavaScript(puzzleProbeScript()),
+        10000,
+        null,
+        'probe executeJavaScript',
+      )
       if (geo && typeof geo.x === 'number' && geo.bgImage) {
         return {
           ...geo,
@@ -423,7 +468,12 @@ export async function locatePuzzle(
 export function humanTrajectory(distance: number): Array<{ dx: number; dy: number }> {
   const points: Array<{ dx: number; dy: number }> = []
   const steps = 45 + Math.floor(Math.random() * 30)
-  const overshoot = Math.min(12, 3 + Math.random() * 5 + distance * 0.015)
+  // Sign-aware: closed-loop correction drags can be NEGATIVE (pull the piece
+  // back after an overshoot). The overshoot must point along the drag
+  // direction, otherwise a pull-back stroke would surge forward first and
+  // zig-zag across the gap.
+  const dir = distance < 0 ? -1 : 1
+  const overshoot = dir * Math.min(12, 3 + Math.random() * 5 + Math.abs(distance) * 0.015)
   let yDrift = 0
 
   for (let i = 1; i <= steps; i++) {
@@ -454,12 +504,16 @@ export async function dragHandle(
   geo: { x: number; y: number; handleWidth: number; trackWidth: number },
   distanceOverride?: number,
 ): Promise<void> {
-  const distance = Math.max(
-    20,
+  // NOTE: no Math.max(20, …) clamp here. The closed-loop correction drags by
+  // the measured residual, which can be NEGATIVE (piece overshot the gap and
+  // must be pulled back); clamping to +20 would turn every pull-back nudge
+  // into a +20 push and make the residual oscillate instead of converging.
+  // Only guard against degenerate zero-length drags on the full-stroke path.
+  const raw =
     distanceOverride != null
       ? Math.round(distanceOverride)
-      : geo.trackWidth - geo.handleWidth - 1,
-  )
+      : geo.trackWidth - geo.handleWidth - 1
+  const distance = raw === 0 ? (distanceOverride != null ? 0 : 20) : raw
   const startX = Math.round(geo.x)
   const startY = Math.round(geo.y)
 
@@ -627,8 +681,12 @@ export interface DragPlan {
   gapCenterDom: number
   /** piece center (or track-start assumption) in viewport-absolute CSS px */
   pieceStart: number
-  /** drag delta in CSS px */
+  /** required PIECE displacement in CSS px */
   distance: number
+  /** handle-travel / piece-travel stroke ratio (1 when unknown or equal) */
+  ratio: number
+  /** required HANDLE displacement in CSS px = distance * ratio */
+  handleDistance: number
 }
 
 export function planDrag(
@@ -637,6 +695,8 @@ export function planDrag(
     bgNaturalWidth: number
     bgOffsetX: number
     handleWidth: number
+    trackWidth?: number
+    pieceWidth?: number
     pieceCenterX?: number
   },
   resultX: number,
@@ -648,6 +708,10 @@ export function planDrag(
     geo.bgNaturalWidth > 0
       ? geo.bgNaturalWidth
       : (bgImage ? decodeImageWidth(bgImage) : 0) || geo.bgWidth
+  
+  // Diagnostic: log dimension sources
+  const dimSource = geo.bgNaturalWidth > 0 ? 'probe' : (bgImage && decodeImageWidth(bgImage) ? 'decoded' : 'fallback')
+  
   const scale = natural > 0 ? geo.bgWidth / natural : 1
   const gapCenterDom = geo.bgOffsetX + resultX * scale
   // The drag delta moves the piece's CURRENT center onto the gap center.
@@ -659,7 +723,32 @@ export function planDrag(
     typeof geo.pieceCenterX === 'number' && geo.pieceCenterX < gapCenterDom - 5
       ? geo.pieceCenterX
       : geo.bgOffsetX + geo.handleWidth / 2
-  return { scale, gapCenterDom, pieceStart, distance: gapCenterDom - pieceStart }
+  const distance = gapCenterDom - pieceStart
+
+  // `distance` is how far the PIECE must travel. The handle is dragged
+  // instead, and the two strokes are only equal when the handle's full range
+  // (trackWidth - handleWidth) matches the piece's full range
+  // (bgWidth - pieceWidth). When they differ the widget maps handle travel
+  // onto piece travel proportionally, so dragging the handle by `distance`
+  // lands the piece short/long by that ratio — the residual "差一点" left
+  // after v1.7.9 fixed the coordinate origin. Convert piece -> handle.
+  const pieceTravel =
+    typeof geo.pieceWidth === 'number' && geo.bgWidth > geo.pieceWidth + 8
+      ? geo.bgWidth - geo.pieceWidth
+      : 0
+  const handleTravel =
+    typeof geo.trackWidth === 'number' && geo.trackWidth > geo.handleWidth + 8
+      ? geo.trackWidth - geo.handleWidth
+      : 0
+  let ratio = pieceTravel > 0 && handleTravel > 0 ? handleTravel / pieceTravel : 1
+  if (!Number.isFinite(ratio) || ratio <= 0) ratio = 1
+  ratio = Math.max(0.2, Math.min(5, ratio))
+  let handleDistance = distance * ratio
+  // Never ask the handle for more than its physical stroke; the widget
+  // clamps it anyway and an over-long trajectory just looks robotic.
+  if (handleTravel > 0 && handleDistance > handleTravel) handleDistance = handleTravel
+
+  return { scale, gapCenterDom, pieceStart, distance, ratio, handleDistance }
 }
 
 /**
@@ -710,6 +799,22 @@ export interface SolvePuzzleOptions {
   verifySolved?: () => Promise<boolean>
   /** Drag attempts before giving up (default 3; each retry refreshes the puzzle). */
   maxAttempts?: number
+  /** Hard watchdog for the whole solve (default 150s); releases the dedupe entry on timeout. */
+  totalTimeoutMs?: number
+}
+
+/**
+ * Closed-loop residual: how far the piece still is from the gap AFTER a
+ * drag, measured from the live DOM instead of assumed from mapping math.
+ * Returns 0 when the residual is negligible (<=2px) or implausibly large
+ * (the drag was rejected outright / the piece reset — the next attempt
+ * re-drags from scratch on a fresh image instead of nudging).
+ */
+export function correctionDelta(gapCenterDom: number, pieceNow: number, distance: number): number {
+  const residual = gapCenterDom - pieceNow
+  const cap = Math.max(60, distance * 0.75)
+  if (Math.abs(residual) <= 2 || Math.abs(residual) > cap) return 0
+  return residual
 }
 
 /**
@@ -726,18 +831,41 @@ export async function solvePuzzle(wc: WebContents, options: SolvePuzzleOptions =
   const pending = activeSolves.get(wc)
   if (pending) return pending
 
-  const run = solvePuzzleInner(wc, options)
+  const generation = (solveGenerations.get(wc) ?? 0) + 1
+  solveGenerations.set(wc, generation)
+  const run = solvePuzzleInner(wc, options, generation)
   activeSolves.set(wc, run)
+  // Hard watchdog: even with per-probe deadlines a pathological sequence can
+  // overrun; when it does, release the dedupe entry so the next watcher tick
+  // starts a FRESH attempt instead of awaiting the stuck promise forever.
+  // Bumping the generation also silences the orphaned inner loop so it stops
+  // dragging/refreshing under the fresh attempt's feet.
+  const watchdog = new Promise<boolean>((resolve) => {
+    setTimeout(() => {
+      if ((solveGenerations.get(wc) ?? 0) > generation) return
+      solveGenerations.set(wc, generation + 1)
+      logPuzzle('warn', 'solve watchdog fired; releasing dedupe entry for a fresh attempt')
+      console.warn('[PuzzleSolver] solve watchdog fired; releasing dedupe entry')
+      resolve(false)
+    }, options.totalTimeoutMs ?? 150000)
+  })
   try {
-    return await run
+    return await Promise.race([run, watchdog])
   } finally {
     if (activeSolves.get(wc) === run) activeSolves.delete(wc)
   }
 }
 
-async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): Promise<boolean> {
+async function solvePuzzleInner(
+  wc: WebContents,
+  options: SolvePuzzleOptions,
+  generation: number,
+): Promise<boolean> {
   const onStatus = options.onStatus || (() => {})
   const maxAttempts = options.maxAttempts ?? 3
+  // Orphan guard: the watchdog (or a newer solve) bumped the generation while
+  // this loop was awaiting — stop silently so two loops never drag at once.
+  const stale = (): boolean => (solveGenerations.get(wc) ?? generation) !== generation
 
   const defaultVerify = async (): Promise<boolean> => {
     await sleep(1800 + Math.random() * 700)
@@ -745,7 +873,12 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // Puzzle gone (modal dismissed / page navigated) means solved.
     if (!(await locatePuzzle(wc))) return true
     try {
-      const body = await wc.executeJavaScript(`document.body ? (document.body.innerText || '') : ''`)
+      const body = await withDeadline(
+        wc.executeJavaScript(`document.body ? (document.body.innerText || '') : ''`),
+        6000,
+        '',
+        'verify innerText',
+      )
       return /验证成功|验证通过|校验成功|验证已完成/.test(String(body || ''))
     } catch {
       return false
@@ -754,7 +887,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
   const verify = options.verifySolved || defaultVerify
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (wc.isDestroyed()) return false
+    if (wc.isDestroyed() || stale()) return false
 
     // Locate (or re-locate after a failed attempt) the puzzle.
     const diagnostics: string[] = []
@@ -777,12 +910,26 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // fitted PNGs here, otherwise Geepass rejects the payload.
     ensureSubmissionNormalized(geo)
 
+    // A leftover failure banner means the CURRENT image was already tried
+    // and rejected — recognizing it again just reproduces the same bad drag
+    // ("失败也没有重试" is really "retried the same dead image"). Swap to a
+    // fresh image before spending a recognition call on it.
+    if (geo.failed) {
+      console.log('[PuzzleSolver] failure banner present; refreshing before recognition')
+      logPuzzle('info', 'failure banner present; refreshing before recognition')
+      await clickPuzzleRefresh(wc, geo)
+      const refreshed = await locatePuzzle(wc)
+      if (refreshed && refreshed.bgImage) {
+        Object.assign(geo, refreshed)
+        ensureSubmissionNormalized(geo)
+      }
+    }
+
     if (attempt === 1) {
-      onStatus('检测到拼图验证，Geepass 正在识别缺口…')
-      logPuzzle('info', `puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`)
-      console.log(
-        `[PuzzleSolver] puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`,
-      )
+      onStatus('检测到拼图验证,Geepass 正在识别缺口…')
+      const diagLine = `puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`
+      logPuzzle('info', diagLine)
+      console.log(`[PuzzleSolver] ${diagLine}`)
     } else {
       onStatus(`验证未通过，Geepass 重新识别中（第 ${attempt}/${maxAttempts} 次）…`)
     }
@@ -828,14 +975,21 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       }
     }
     if (!result) {
-      onStatus(`Geepass 识别失败: ${lastError}`)
+      // Do NOT leave the rejected image + failure banner on screen: the next
+      // watcher tick would re-probe the same dead image and the UI reads as
+      // "stuck on the new captcha". Swap in a fresh puzzle and report clearly.
+      onStatus(`Geepass 识别失败: ${lastError}，已换图等待下次自动识别`)
+      logPuzzle('error', `recognition failed: ${lastError}; refreshing for the next tick`)
+      await clickPuzzleRefresh(wc, geo)
       return false
     }
 
     // Scale the recognized gap X (submitted image pixels) to DOM pixels and
-    // map it into viewport-absolute CSS px (see planDrag).
+    // map it into viewport-absolute CSS px (see planDrag). planDrag also
+    // converts the required PIECE displacement into the HANDLE displacement
+    // when the two strokes differ.
     const plan = planDrag(geo, result.x, geo.bgImage)
-    const { scale, gapCenterDom, pieceStart, distance } = plan
+    const { scale, gapCenterDom, pieceStart, distance, ratio, handleDistance } = plan
     if (!Number.isFinite(distance) || distance < 5) {
       // Gap recognized at/behind the track start: nothing sensible to drag.
       // Refresh for a new puzzle and retry instead of giving up silently.
@@ -844,13 +998,35 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
       await clickPuzzleRefresh(wc, geo)
       continue
     }
-    console.log(
-      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} attempt=${attempt}`,
-    )
+    const planLine = `gap x=${result.x} scale=${scale.toFixed(3)} bgW=${geo.bgWidth} bgNat=${geo.bgNaturalWidth} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} ratio=${ratio.toFixed(3)} handleDistance=${handleDistance.toFixed(1)} pieceW=${geo.pieceWidth ?? 'n/a'} track=${geo.trackWidth} handle=${geo.handleWidth} attempt=${attempt}`
+    logPuzzle('info', planLine)
+    console.log(`[PuzzleSolver] ${planLine}`)
     onStatus('Geepass 识别成功，正在拖动滑块…')
 
+    if (stale()) return false
     await sleep(300 + Math.random() * 400)
-    await dragHandle(wc, geo, distance)
+    await dragHandle(wc, geo, handleDistance)
+
+    // Closed-loop correction: measure where the piece ACTUALLY landed and
+    // nudge the handle by the residual. Every mapping assumption (submitted
+    // image scale, stroke ratio, frame offsets) can be slightly off; the
+    // rendered piece is the ground truth. correctionDelta skips negligible
+    // residuals and implausibly large ones (drag rejected / piece reset).
+    if (stale()) return false
+    await sleep(500 + Math.random() * 300)
+    const landed = await locatePuzzle(wc)
+    if (!stale() && landed && typeof landed.pieceCenterX === 'number') {
+      const residual = correctionDelta(gapCenterDom, landed.pieceCenterX, distance)
+      if (residual !== 0) {
+        const corrLine = `closed-loop correction residual=${residual.toFixed(1)} pieceNow=${landed.pieceCenterX.toFixed(1)} gapCenterDom=${gapCenterDom.toFixed(1)} attempt=${attempt}`
+        logPuzzle('info', corrLine)
+        console.log(`[PuzzleSolver] ${corrLine}`)
+        onStatus('落点微调中…')
+        await dragHandle(wc, landed, residual * ratio)
+        await sleep(400 + Math.random() * 300)
+      }
+    }
+
     if (await verify()) {
       console.log('[PuzzleSolver] Puzzle solved')
       onStatus('拼图验证通过')
@@ -860,6 +1036,7 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
     // Failed: the captcha now shows a failure banner. Click refresh to get
     // a brand-new puzzle image before the next attempt.
     console.log(`[PuzzleSolver] attempt ${attempt}/${maxAttempts} failed, refreshing puzzle`)
+    if (stale()) return false
     await clickPuzzleRefresh(wc, geo)
   }
 
@@ -867,25 +1044,65 @@ async function solvePuzzleInner(wc: WebContents, options: SolvePuzzleOptions): P
   return false
 }
 
-/** Click the puzzle refresh button (small icon at the bg top-right corner). */
-async function clickPuzzleRefresh(wc: WebContents, geo: PuzzleGeometry): Promise<void> {
-  if (wc.isDestroyed()) return
-  if (typeof geo.refreshX === 'number' && typeof geo.refreshY === 'number') {
-    const x = Math.round(geo.refreshX)
-    const y = Math.round(geo.refreshY)
-    wc.sendInputEvent({ type: 'mouseMove', x, y, clickCount: 0 })
-    await sleep(60 + Math.random() * 80)
-    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
-    wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
-  } else {
-    // No refresh button found — click the background itself; several Aliyun
-    // punish variants reload the puzzle on a background click.
-    const x = Math.round(geo.bgOffsetX + geo.bgWidth / 2)
-    const y = Math.round(geo.y - geo.handleWidth * 2)
-    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
-    wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+/**
+ * Cheap content fingerprint for a base64 image, used to detect whether a
+ * refresh actually swapped the puzzle. PNG payloads share a fixed header, so
+ * the length plus a couple of interior samples distinguish distinct images
+ * without hashing the whole (often multi-hundred-KB) string.
+ */
+function imageFingerprint(b64: string): string {
+  if (!b64) return ''
+  const n = b64.length
+  const q1 = b64.slice(Math.floor(n / 4), Math.floor(n / 4) + 16)
+  const mid = b64.slice(Math.floor(n / 2), Math.floor(n / 2) + 24)
+  return `${n}:${q1}:${mid}`
+}
+
+/** Re-probe and report whether the bg image differs from `before`. */
+async function puzzleImageChanged(wc: WebContents, before: string): Promise<boolean> {
+  if (wc.isDestroyed()) return false
+  const next = await locatePuzzle(wc)
+  if (!next || !next.bgImage) return true // puzzle gone => treat as changed
+  return imageFingerprint(next.bgImage) !== before
+}
+
+/**
+ * Click the puzzle refresh button (small icon at the bg top-right corner).
+ * Verifies the image actually changed; some variants ignore the first click
+ * or auto-reload on failure, and without this check the SAME failed image
+ * gets recognized again and lands on the same spot (the "验证失败重新出了
+ * 验证图不会接着认证" symptom). Clicks at most twice. Returns true when the
+ * puzzle image changed (or the puzzle disappeared).
+ */
+async function clickPuzzleRefresh(wc: WebContents, geo: PuzzleGeometry): Promise<boolean> {
+  if (wc.isDestroyed()) return false
+  const before = imageFingerprint(geo.bgImage)
+
+  const clickOnce = async (): Promise<void> => {
+    if (typeof geo.refreshX === 'number' && typeof geo.refreshY === 'number') {
+      const x = Math.round(geo.refreshX)
+      const y = Math.round(geo.refreshY)
+      wc.sendInputEvent({ type: 'mouseMove', x, y, clickCount: 0 })
+      await sleep(60 + Math.random() * 80)
+      wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+      wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+    } else {
+      // No refresh button found — click the background itself; several Aliyun
+      // punish variants reload the puzzle on a background click.
+      const x = Math.round(geo.bgOffsetX + geo.bgWidth / 2)
+      const y = Math.round(geo.y - geo.handleWidth * 2)
+      wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+      wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
+    }
+    await sleep(900 + Math.random() * 600)
   }
-  await sleep(900 + Math.random() * 600)
+
+  await clickOnce()
+  if (await puzzleImageChanged(wc, before)) return true
+  // First click did not swap the image; try once more.
+  logPuzzle('warn', 'refresh did not change the puzzle image; clicking again')
+  await clickOnce()
+  return puzzleImageChanged(wc, before)
 }
 
 // ==================== Global puzzle watcher ====================
