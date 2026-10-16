@@ -995,9 +995,9 @@ async function solvePuzzleInner(
       await clickPuzzleRefresh(wc, geo)
       continue
     }
-    console.log(
-      `[PuzzleSolver] gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} ratio=${ratio.toFixed(3)} handleDistance=${handleDistance.toFixed(1)} pieceW=${geo.pieceWidth ?? 'n/a'} track=${geo.trackWidth} handle=${geo.handleWidth} attempt=${attempt}`,
-    )
+    const planLine = `gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} ratio=${ratio.toFixed(3)} handleDistance=${handleDistance.toFixed(1)} pieceW=${geo.pieceWidth ?? 'n/a'} track=${geo.trackWidth} handle=${geo.handleWidth} attempt=${attempt}`
+    logPuzzle('info', planLine)
+    console.log(`[PuzzleSolver] ${planLine}`)
     onStatus('Geepass 识别成功，正在拖动滑块…')
 
     if (stale()) return false
@@ -1015,10 +1015,9 @@ async function solvePuzzleInner(
     if (!stale() && landed && typeof landed.pieceCenterX === 'number') {
       const residual = correctionDelta(gapCenterDom, landed.pieceCenterX, distance)
       if (residual !== 0) {
-        console.log(
-          `[PuzzleSolver] closed-loop correction residual=${residual.toFixed(1)} pieceNow=${landed.pieceCenterX.toFixed(1)} gapCenterDom=${gapCenterDom.toFixed(1)} attempt=${attempt}`,
-        )
-        logPuzzle('info', `closed-loop correction residual=${residual.toFixed(1)} pieceNow=${landed.pieceCenterX.toFixed(1)} attempt=${attempt}`)
+        const corrLine = `closed-loop correction residual=${residual.toFixed(1)} pieceNow=${landed.pieceCenterX.toFixed(1)} gapCenterDom=${gapCenterDom.toFixed(1)} attempt=${attempt}`
+        logPuzzle('info', corrLine)
+        console.log(`[PuzzleSolver] ${corrLine}`)
         onStatus('落点微调中…')
         await dragHandle(wc, landed, residual * ratio)
         await sleep(400 + Math.random() * 300)
