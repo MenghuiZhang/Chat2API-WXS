@@ -708,6 +708,10 @@ export function planDrag(
     geo.bgNaturalWidth > 0
       ? geo.bgNaturalWidth
       : (bgImage ? decodeImageWidth(bgImage) : 0) || geo.bgWidth
+  
+  // Diagnostic: log dimension sources
+  const dimSource = geo.bgNaturalWidth > 0 ? 'probe' : (bgImage && decodeImageWidth(bgImage) ? 'decoded' : 'fallback')
+  
   const scale = natural > 0 ? geo.bgWidth / natural : 1
   const gapCenterDom = geo.bgOffsetX + resultX * scale
   // The drag delta moves the piece's CURRENT center onto the gap center.
@@ -922,11 +926,10 @@ async function solvePuzzleInner(
     }
 
     if (attempt === 1) {
-      onStatus('检测到拼图验证，Geepass 正在识别缺口…')
-      logPuzzle('info', `puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`)
-      console.log(
-        `[PuzzleSolver] puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`,
-      )
+      onStatus('检测到拼图验证,Geepass 正在识别缺口…')
+      const diagLine = `puzzle found via=${geo.handleFound || 'selector'} bgVia=${geo.bgVia || 'canvas'} bgW=${geo.bgWidth} submitted=${geo.bgNaturalWidth} handle=${geo.handleWidth} track=${geo.trackWidth} piece=${geo.pieceCenterX ?? 'n/a'} refresh=${geo.refreshX ? 'yes' : 'no'}`
+      logPuzzle('info', diagLine)
+      console.log(`[PuzzleSolver] ${diagLine}`)
     } else {
       onStatus(`验证未通过，Geepass 重新识别中（第 ${attempt}/${maxAttempts} 次）…`)
     }
@@ -995,7 +998,7 @@ async function solvePuzzleInner(
       await clickPuzzleRefresh(wc, geo)
       continue
     }
-    const planLine = `gap x=${result.x} scale=${scale.toFixed(3)} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} ratio=${ratio.toFixed(3)} handleDistance=${handleDistance.toFixed(1)} pieceW=${geo.pieceWidth ?? 'n/a'} track=${geo.trackWidth} handle=${geo.handleWidth} attempt=${attempt}`
+    const planLine = `gap x=${result.x} scale=${scale.toFixed(3)} bgW=${geo.bgWidth} bgNat=${geo.bgNaturalWidth} bgOffsetX=${geo.bgOffsetX} gapCenterDom=${gapCenterDom.toFixed(1)} pieceStart=${pieceStart.toFixed(1)} distance=${distance.toFixed(1)} ratio=${ratio.toFixed(3)} handleDistance=${handleDistance.toFixed(1)} pieceW=${geo.pieceWidth ?? 'n/a'} track=${geo.trackWidth} handle=${geo.handleWidth} attempt=${attempt}`
     logPuzzle('info', planLine)
     console.log(`[PuzzleSolver] ${planLine}`)
     onStatus('Geepass 识别成功，正在拖动滑块…')
